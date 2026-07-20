@@ -2582,8 +2582,14 @@ static void ggml_hexagon_precompute_matmul_params(
 
     const size_t vtcm_budget = sess->vtcm_size;
 
+    // Small KV-cache matmuls are repeatedly split into standalone batches when
+    // semantic op filtering is enabled. Keep them on HTP, but use the stable HVX
+    // path instead of HMX to avoid stalling the DSP queue after many small graphs.
+    const bool is_kv_cache_mm = strncmp(src0->name, "cache_k_", 8) == 0 ||
+                                strncmp(src0->name, "cache_v_", 8) == 0;
+
     // Check HMX eligibility and try precomputing HMX parameters
-    bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3);
+    bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3) && !is_kv_cache_mm;
     if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched)) {
         if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)) {
             goto finalize;
