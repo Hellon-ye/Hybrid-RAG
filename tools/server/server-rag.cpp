@@ -1,7 +1,10 @@
 #include "server-rag.h"
 
+#include <algorithm>
 #include <cctype>
 #include <sstream>
+#include <stdexcept>
+#include <unordered_map>
 #include <utility>
 
 std::string rag_trim(std::string value) {
@@ -49,6 +52,126 @@ std::vector<std::string> rag_split_document(
     }
 
     return chunks;
+}
+
+std::vector<std::size_t> rag_search_inner_product(
+        const std::vector<std::vector<float>> & doc_embeddings,
+        const std::vector<std::size_t> & doc_embedding_source_indices,
+        const std::vector<float> & query_embedding,
+        std::size_t top_k) {
+    if (doc_embeddings.empty()) {
+        throw std::runtime_error("document embeddings are empty");
+    }
+
+    if (query_embedding.empty()) {
+        throw std::runtime_error("query embedding is empty");
+    }
+
+    if (doc_embeddings.size() != doc_embedding_source_indices.size()) {
+        throw std::runtime_error(
+                "doc embedding index mapping size mismatch");
+    }
+
+    const std::size_t dimension = query_embedding.size();
+
+    struct scored_embedding {
+        std::size_t dense_index;
+        float score;
+    };
+
+    std::vector<scored_embedding> scored;
+    scored.reserve(doc_embeddings.size());
+
+    for (std::size_t dense_index = 0;
+         dense_index < doc_embeddings.size();
+         ++dense_index) {
+        const auto & embedding = doc_embeddings[dense_index];
+
+        if (embedding.size() != dimension) {
+            throw std::runtime_error("embedding dimension mismatch");
+        }
+
+        float score = 0.0F;
+
+        for (std::size_t dim = 0; dim < dimension; ++dim) {
+            score += embedding[dim] * query_embedding[dim];
+        }
+
+        scored.push_back({
+            dense_index,
+            score,
+        });
+    }
+
+    std::sort(
+            scored.begin(),
+            scored.end(),
+            [](const scored_embedding & lhs,
+               const scored_embedding & rhs) {
+                if (lhs.score != rhs.score) {
+                    return lhs.score > rhs.score;
+                }
+
+                return lhs.dense_index < rhs.dense_index;
+            });
+
+    const std::size_t keep_n = std::min(top_k, scored.size());
+
+    std::vector<std::size_t> top_indices;
+    top_indices.reserve(keep_n);
+
+    for (std::size_t rank = 0; rank < keep_n; ++rank) {
+        const std::size_t dense_index = scored[rank].dense_index;
+        top_indices.push_back(
+                doc_embedding_source_indices[dense_index]);
+    }
+
+    return top_indices;
+}
+
+std::vector<std::size_t> rag_merge_subquery_hits(
+        const std::vector<std::vector<std::size_t>> & per_query_hits,
+        std::size_t top_k) {
+    std::unordered_map<std::size_t, float> score_by_index;
+
+    for (const auto & hits : per_query_hits) {
+        for (std::size_t rank = 0; rank < hits.size(); ++rank) {
+            const std::size_t index = hits[rank];
+
+            score_by_index[index] +=
+                    1.0F / (1.0F + static_cast<float>(rank));
+        }
+    }
+
+    std::vector<std::pair<std::size_t, float>> scored_hits;
+    scored_hits.reserve(score_by_index.size());
+
+    for (const auto & [index, score] : score_by_index) {
+        scored_hits.emplace_back(index, score);
+    }
+
+    std::sort(
+            scored_hits.begin(),
+            scored_hits.end(),
+            [](const auto & lhs, const auto & rhs) {
+                if (lhs.second != rhs.second) {
+                    return lhs.second > rhs.second;
+                }
+
+                return lhs.first < rhs.first;
+            });
+
+    const std::size_t keep_n =
+            std::min(top_k, scored_hits.size());
+
+    std::vector<std::size_t> merged_indices;
+    merged_indices.reserve(keep_n);
+
+    for (std::size_t index = 0; index < keep_n; ++index) {
+        merged_indices.push_back(scored_hits[index].first);
+    }
+
+    return merged_indices;
 }
 
 std::string build_generation_prompt(

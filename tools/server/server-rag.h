@@ -45,6 +45,16 @@ std::string rag_trim(std::string value);
 std::vector<std::string> rag_split_document(
         const std::string & document);
 
+std::vector<std::size_t> rag_search_inner_product(
+        const std::vector<std::vector<float>> & doc_embeddings,
+        const std::vector<std::size_t> & doc_embedding_source_indices,
+        const std::vector<float> & query_embedding,
+        std::size_t top_k);
+
+std::vector<std::size_t> rag_merge_subquery_hits(
+        const std::vector<std::vector<std::size_t>> & per_query_hits,
+        std::size_t top_k);
+
 std::string build_generation_prompt(
         const std::string & query,
         const std::vector<std::string> & context_chunks);
@@ -53,3 +63,4 @@ std::vector<std::string> build_generation_segments(
         const std::string & query,
         const std::vector<std::string> & sub_queries,
         const std::vector<std::string> & context_chunks);
+
