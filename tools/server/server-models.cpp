@@ -1722,6 +1722,98 @@ void server_models_routes::init_routes() {
         return models.proxy_request(req, method, name, true); // update last usage for POST request only
     };
 
+    this->post_rag = [this](const server_http_req & req) {
+    auto res = std::make_unique<server_http_res>();
+
+    const json body = json::parse(req.body);
+
+    const std::string query =
+            json_value(body, "query", std::string());
+
+    const std::string generation_model =
+            json_value(body, "generation_model", std::string());
+
+    const int max_tokens =
+            json_value(body, "max_tokens", 64);
+
+    const float temperature =
+            json_value(body, "temperature", 0.1F);
+
+    if (query.empty()) {
+        res_err(
+                res,
+                format_error_response(
+                        "query is missing from the request",
+                        ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    if (generation_model.empty()) {
+        res_err(
+                res,
+                format_error_response(
+                        "generation_model is missing from the request",
+                        ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    if (max_tokens <= 0) {
+        res_err(
+                res,
+                format_error_response(
+                        "max_tokens must be greater than zero",
+                        ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    json generation_request = {
+        {"model", generation_model},
+        {"messages", json::array({
+            {
+                {"role", "user"},
+                {"content", query},
+            },
+        })},
+        {"max_tokens",  max_tokens},
+        {"temperature", temperature},
+        {"stream",      false},
+    };
+
+    const json generation_response = models.request_model_json(
+            generation_model,
+            "/v1/chat/completions",
+            generation_request);
+
+    if (!generation_response.contains("choices") ||
+        !generation_response["choices"].is_array() ||
+        generation_response["choices"].empty()) {
+        throw std::runtime_error(
+                "generation model returned no choices");
+    }
+
+    const json & choice = generation_response["choices"][0];
+
+    if (!choice.contains("message") ||
+        !choice["message"].is_object() ||
+        !choice["message"].contains("content") ||
+        !choice["message"]["content"].is_string()) {
+        throw std::runtime_error(
+                "generation model returned an invalid chat completion response");
+    }
+
+    const std::string answer =
+            choice["message"]["content"].get<std::string>();
+
+    res_ok(res, {
+        {"answer",           answer},
+        {"mode",             "sequential_minimal"},
+        {"generation_model", generation_model},
+        {"query",            query},
+    });
+
+    return res;
+};
+
     this->post_router_models_load = [this](const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
         json body = json::parse(req.body);
