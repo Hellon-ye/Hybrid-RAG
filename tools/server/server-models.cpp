@@ -1243,6 +1243,105 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
     return proxy;
 }
 
+json server_models::request_model_json(
+        const std::string & model,
+        const std::string & path,
+        const json & request_body) {
+    if (model.empty()) {
+        throw std::invalid_argument("internal model request is missing model name");
+    }
+
+    if (path.empty() || path.front() != '/') {
+        throw std::invalid_argument(
+                "internal model request path must start with '/': " + path);
+    }
+
+    // Resolve an alias to the canonical model name.
+    auto meta = get_meta(model);
+    if (!meta.has_value()) {
+        throw std::runtime_error("model name=" + model + " is not found");
+    }
+
+    const std::string name = meta->name;
+
+    // Start the child process when necessary and wait until loading completes.
+    ensure_model_ready(name);
+
+    // Metadata must be refreshed after ensure_model_ready(), because loading
+    // can create the child process and assign its listening port.
+    meta = get_meta(name);
+    if (!meta.has_value()) {
+        throw std::runtime_error(
+                "model name=" + name + " disappeared after loading");
+    }
+
+    if (!meta->is_running()) {
+        throw std::runtime_error(
+                "model name=" + name + " is not running after loading");
+    }
+
+    // Match proxy_request() behavior so that router LRU accounting remains
+    // correct for requests made by the RAG orchestrator.
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = mapping.find(name);
+        if (it != mapping.end()) {
+            it->second.meta.last_used = ggml_time_ms();
+        }
+    }
+
+    json body = request_body;
+    body["model"] = name;
+
+    SRV_INF(
+            "sending internal JSON request to model %s on port %d, path=%s\n",
+            name.c_str(),
+            meta->port,
+            path.c_str());
+
+    httplib::Client cli(CHILD_ADDR, meta->port);
+
+    // Use the same router timeout configuration as ordinary model requests.
+    cli.set_read_timeout(base_params.timeout_read, 0);
+    cli.set_write_timeout(base_params.timeout_write, 0);
+
+    const auto response = cli.Post(
+            path,
+            body.dump(),
+            "application/json");
+
+    if (!response) {
+        throw std::runtime_error(
+                "internal request to model=" + name +
+                ", path=" + path +
+                " failed before receiving an HTTP response");
+    }
+
+    if (response->status < 200 || response->status >= 300) {
+        throw std::runtime_error(
+                "internal request to model=" + name +
+                ", path=" + path +
+                " returned HTTP " + std::to_string(response->status) +
+                ": " + response->body);
+    }
+
+    if (response->body.empty()) {
+        throw std::runtime_error(
+                "internal request to model=" + name +
+                ", path=" + path +
+                " returned an empty body");
+    }
+
+    try {
+        return json::parse(response->body);
+    } catch (const json::parse_error & e) {
+        throw std::runtime_error(
+                "internal request to model=" + name +
+                ", path=" + path +
+                " returned invalid JSON: " + std::string(e.what()));
+    }
+}
+
 void server_models::handle_child_state(const std::string & name, const std::string & raw_input) {
     server_state state;
     json payload;

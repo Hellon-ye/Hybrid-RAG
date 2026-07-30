@@ -251,6 +251,11 @@ public:
     // proxy an HTTP request to the model instance
     server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used);
 
+    // Send a blocking JSON request from the router to a model child process.
+    // Intended for internal orchestration such as the sequential RAG pipeline.
+    // Streaming responses are not supported by this interface.
+    json request_model_json(const std::string & model, const std::string & path, const json & request_body);
+
     // handle message sent from server_child::notify_to_router()
     // raw input must starts with CMD_CHILD_TO_ROUTER_STATE, followed by a JSON string
     // this function is not thread-safe, must be called from instance's monitoring thread
