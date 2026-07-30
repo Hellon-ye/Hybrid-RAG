@@ -3,6 +3,7 @@
 #include "server-models.h"
 #include "server-context.h"
 #include "server-stream.h"
+#include "server-rag.h"
 
 #include "build-info.h"
 #include "preset.h"
@@ -1727,6 +1728,9 @@ void server_models_routes::init_routes() {
 
         const json body = json::parse(req.body);
 
+        const std::string doc =
+                json_value(body, "doc", std::string());
+
         const std::string query =
                 json_value(body, "query", std::string());
 
@@ -1738,6 +1742,15 @@ void server_models_routes::init_routes() {
 
         const float temperature =
                 json_value(body, "temperature", 0.1F);
+
+        if (doc.empty()) {
+            res_err(
+                    res,
+                    format_error_response(
+                            "doc is missing from the request",
+                            ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
 
         if (query.empty()) {
             res_err(
@@ -1769,8 +1782,20 @@ void server_models_routes::init_routes() {
         // The current baseline uses a Base model rather than an
         // instruction/chat model. Therefore, use llama.cpp's raw
         // completion endpoint instead of /v1/chat/completions.
+        const std::vector<std::string> context_chunks =
+                rag_split_document(doc);
+
+        if (context_chunks.empty()) {
+            res_err(
+                    res,
+                    format_error_response(
+                            "doc produced no context chunks",
+                            ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
         const std::string prompt =
-                "问题：" + query + "\n回答：";
+                build_generation_prompt(query, context_chunks);
 
         json generation_request = {
             {"model",       generation_model},
@@ -1796,9 +1821,11 @@ void server_models_routes::init_routes() {
 
         json response_data = {
             {"answer",           answer},
-            {"mode",             "sequential_minimal"},
+            {"mode",             "context_augmented_minimal"},
             {"generation_model", generation_model},
             {"query",            query},
+            {"context_chunks",   context_chunks},
+            {"chunk_count",      context_chunks.size()},
         };
 
         // Preserve llama.cpp timing information when available. This will

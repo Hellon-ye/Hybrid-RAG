@@ -41,6 +41,8 @@ add_library(${TARGET}
     server-http.h
     server-models.cpp
     server-models.h
+    server-rag.cpp
+    server-rag.h
 )
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
