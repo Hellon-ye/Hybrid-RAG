@@ -256,6 +256,12 @@ public:
     // Streaming responses are not supported by this interface.
     json request_model_json(const std::string & model, const std::string & path, const json & request_body);
 
+    // Send a batch embedding request to a model child process and return
+    // one float vector for each input text, preserving input order.
+    std::vector<std::vector<float>> request_model_embeddings(
+            const std::string & model,
+            const std::vector<std::string> & inputs);
+
     // handle message sent from server_child::notify_to_router()
     // raw input must starts with CMD_CHILD_TO_ROUTER_STATE, followed by a JSON string
     // this function is not thread-safe, must be called from instance's monitoring thread

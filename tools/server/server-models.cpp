@@ -1343,6 +1343,87 @@ json server_models::request_model_json(
     }
 }
 
+
+std::vector<std::vector<float>> server_models::request_model_embeddings(
+        const std::string & model,
+        const std::vector<std::string> & inputs) {
+    if (inputs.empty()) {
+        throw std::invalid_argument(
+                "embedding request contains no input texts");
+    }
+
+    const json request_body = {
+        {"input", inputs},
+        {"encoding_format", "float"},
+    };
+
+    const json response = request_model_json(
+            model,
+            "/v1/embeddings",
+            request_body);
+
+    if (!response.contains("data") ||
+        !response["data"].is_array()) {
+        throw std::runtime_error(
+                "embedding model returned a response without a data array");
+    }
+
+    const json & data = response["data"];
+
+    if (data.size() != inputs.size()) {
+        throw std::runtime_error(
+                "embedding response count does not match input count");
+    }
+
+    std::vector<std::vector<float>> embeddings;
+    embeddings.reserve(data.size());
+
+    std::size_t expected_dimension = 0;
+
+    for (std::size_t index = 0; index < data.size(); ++index) {
+        const json & item = data.at(index);
+
+        if (!item.is_object() ||
+            !item.contains("embedding") ||
+            !item["embedding"].is_array()) {
+            throw std::runtime_error(
+                    "embedding response item " +
+                    std::to_string(index) +
+                    " does not contain an embedding array");
+        }
+
+        std::vector<float> embedding;
+
+        try {
+            embedding =
+                    item["embedding"].get<std::vector<float>>();
+        } catch (const json::exception & e) {
+            throw std::runtime_error(
+                    "failed to parse embedding response item " +
+                    std::to_string(index) +
+                    ": " + std::string(e.what()));
+        }
+
+        if (embedding.empty()) {
+            throw std::runtime_error(
+                    "embedding response item " +
+                    std::to_string(index) +
+                    " is empty");
+        }
+
+        if (expected_dimension == 0) {
+            expected_dimension = embedding.size();
+        } else if (embedding.size() != expected_dimension) {
+            throw std::runtime_error(
+                    "embedding response contains inconsistent dimensions");
+        }
+
+        embeddings.push_back(std::move(embedding));
+    }
+
+    return embeddings;
+}
+
 void server_models::handle_child_state(const std::string & name, const std::string & raw_input) {
     server_state state;
     json payload;
@@ -1737,6 +1818,12 @@ void server_models_routes::init_routes() {
         const std::string generation_model =
                 json_value(body, "generation_model", std::string());
 
+        const std::string embedding_model =
+                json_value(body, "embedding_model", std::string());
+
+        const int top_k =
+                json_value(body, "top_k", 20);
+
         const int max_tokens =
                 json_value(body, "max_tokens", 64);
 
@@ -1770,6 +1857,24 @@ void server_models_routes::init_routes() {
             return res;
         }
 
+        if (embedding_model.empty()) {
+            res_err(
+                    res,
+                    format_error_response(
+                            "embedding_model is missing from the request",
+                            ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        if (top_k <= 0) {
+            res_err(
+                    res,
+                    format_error_response(
+                            "top_k must be greater than zero",
+                            ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
         if (max_tokens <= 0) {
             res_err(
                     res,
@@ -1779,13 +1884,11 @@ void server_models_routes::init_routes() {
             return res;
         }
 
-        // The current baseline uses a Base model rather than an
-        // instruction/chat model. Therefore, use llama.cpp's raw
-        // completion endpoint instead of /v1/chat/completions.
-        const std::vector<std::string> context_chunks =
+        // Split the source document before computing embeddings.
+        const std::vector<std::string> source_chunks =
                 rag_split_document(doc);
 
-        if (context_chunks.empty()) {
+        if (source_chunks.empty()) {
             res_err(
                     res,
                     format_error_response(
@@ -1794,6 +1897,59 @@ void server_models_routes::init_routes() {
             return res;
         }
 
+        // Compute document and query embeddings through the Router's
+        // synchronous internal model interface.
+        const std::vector<std::vector<float>> doc_embeddings =
+                models.request_model_embeddings(
+                        embedding_model,
+                        source_chunks);
+
+        const std::vector<std::vector<float>> query_embeddings =
+                models.request_model_embeddings(
+                        embedding_model,
+                        {query});
+
+        if (query_embeddings.size() != 1) {
+            throw std::runtime_error(
+                    "query embedding request returned an invalid count");
+        }
+
+        std::vector<std::size_t> source_indices;
+        source_indices.reserve(source_chunks.size());
+
+        for (std::size_t index = 0;
+             index < source_chunks.size();
+             ++index) {
+            source_indices.push_back(index);
+        }
+
+        const std::vector<std::size_t> retrieved_indices =
+                rag_search_inner_product(
+                        doc_embeddings,
+                        source_indices,
+                        query_embeddings.front(),
+                        static_cast<std::size_t>(top_k));
+
+        std::vector<std::string> context_chunks;
+        context_chunks.reserve(retrieved_indices.size());
+
+        for (const std::size_t index : retrieved_indices) {
+            if (index >= source_chunks.size()) {
+                throw std::runtime_error(
+                        "retrieval returned an out-of-range chunk index");
+            }
+
+            context_chunks.push_back(source_chunks[index]);
+        }
+
+        if (context_chunks.empty()) {
+            throw std::runtime_error(
+                    "retrieval produced no context chunks");
+        }
+
+        // The current baseline uses a Base model rather than an
+        // instruction/chat model. Therefore, use llama.cpp's raw
+        // completion endpoint instead of /v1/chat/completions.
         const std::string prompt =
                 build_generation_prompt(query, context_chunks);
 
@@ -1820,12 +1976,17 @@ void server_models_routes::init_routes() {
                 generation_response["content"].get<std::string>();
 
         json response_data = {
-            {"answer",           answer},
-            {"mode",             "context_augmented_minimal"},
-            {"generation_model", generation_model},
-            {"query",            query},
-            {"context_chunks",   context_chunks},
-            {"chunk_count",      context_chunks.size()},
+            {"answer",                  answer},
+            {"mode",                    "retrieval_augmented_sequential"},
+            {"generation_model",        generation_model},
+            {"embedding_model",         embedding_model},
+            {"query",                   query},
+            {"top_k",                   top_k},
+            {"source_chunk_count",      source_chunks.size()},
+            {"retrieved_chunk_count",   context_chunks.size()},
+            {"retrieved_indices",       retrieved_indices},
+            {"context_chunks",          context_chunks},
+            {"embedding_dimension",     doc_embeddings.front().size()},
         };
 
         // Preserve llama.cpp timing information when available. This will
