@@ -25,6 +25,177 @@ std::string rag_trim(std::string value) {
     return value;
 }
 
+
+namespace {
+
+std::string rag_replace_fullwidth_semicolon(std::string value) {
+    static const std::string fullwidth_semicolon = "；";
+
+    std::size_t position = 0;
+
+    while ((position = value.find(
+                    fullwidth_semicolon,
+                    position)) != std::string::npos) {
+        value.replace(
+                position,
+                fullwidth_semicolon.size(),
+                ";");
+
+        ++position;
+    }
+
+    return value;
+}
+
+std::string rag_strip_subquery_marker(std::string token) {
+    token = rag_trim(std::move(token));
+
+    // Remove common bullet markers.
+    while (!token.empty() &&
+           (token.front() == '-' ||
+            token.front() == '*' ||
+            token.front() == ';')) {
+        token.erase(token.begin());
+        token = rag_trim(std::move(token));
+    }
+
+    // Remove numbered-list markers such as:
+    // "1. query", "2) query", "3、query", "4）query".
+    std::size_t digit_end = 0;
+
+    while (digit_end < token.size() &&
+           std::isdigit(
+                   static_cast<unsigned char>(
+                           token[digit_end])) != 0) {
+        ++digit_end;
+    }
+
+    if (digit_end > 0) {
+        std::size_t marker_end = digit_end;
+        bool has_number_marker = false;
+
+        if (marker_end < token.size() &&
+            (token[marker_end] == '.' ||
+             token[marker_end] == ')' ||
+             token[marker_end] == ':')) {
+            ++marker_end;
+            has_number_marker = true;
+        } else {
+            static const std::string chinese_separator = "、";
+            static const std::string fullwidth_right_parenthesis = "）";
+            static const std::string fullwidth_period = "．";
+
+            if (token.compare(
+                        marker_end,
+                        chinese_separator.size(),
+                        chinese_separator) == 0) {
+                marker_end += chinese_separator.size();
+                has_number_marker = true;
+            } else if (token.compare(
+                               marker_end,
+                               fullwidth_right_parenthesis.size(),
+                               fullwidth_right_parenthesis) == 0) {
+                marker_end += fullwidth_right_parenthesis.size();
+                has_number_marker = true;
+            } else if (token.compare(
+                               marker_end,
+                               fullwidth_period.size(),
+                               fullwidth_period) == 0) {
+                marker_end += fullwidth_period.size();
+                has_number_marker = true;
+            }
+        }
+
+        if (has_number_marker) {
+            token.erase(0, marker_end);
+            token = rag_trim(std::move(token));
+        }
+    }
+
+    return token;
+}
+
+} // namespace
+
+std::vector<std::string> rag_split_sub_queries(
+        const std::string & expanded,
+        std::size_t max_subqueries,
+        std::size_t max_subquery_chars) {
+    std::vector<std::string> sub_queries;
+
+    if (max_subqueries == 0 || max_subquery_chars == 0) {
+        return sub_queries;
+    }
+
+    const std::string normalized =
+            rag_replace_fullwidth_semicolon(expanded);
+
+    std::string current;
+
+    const auto push_token = [&](std::string token) {
+        token = rag_strip_subquery_marker(std::move(token));
+
+        if (token.empty()) {
+            return;
+        }
+
+        if (token.size() > max_subquery_chars) {
+            token.resize(max_subquery_chars);
+            token = rag_trim(std::move(token));
+        }
+
+        if (token.empty()) {
+            return;
+        }
+
+        if (std::find(
+                    sub_queries.begin(),
+                    sub_queries.end(),
+                    token) != sub_queries.end()) {
+            return;
+        }
+
+        sub_queries.push_back(std::move(token));
+    };
+
+    for (const char ch : normalized) {
+        // Accept both the original semicolon format and multiline lists.
+        if (ch == ';' || ch == '\n' || ch == '\r') {
+            push_token(std::move(current));
+            current.clear();
+
+            if (sub_queries.size() >= max_subqueries) {
+                break;
+            }
+
+            continue;
+        }
+
+        current.push_back(ch);
+    }
+
+    if (sub_queries.size() < max_subqueries) {
+        push_token(std::move(current));
+    }
+
+    return sub_queries;
+}
+
+std::string build_query_expansion_prompt(
+        const std::string & query) {
+    return
+            "You are a query rewriter for a retrieval system. "
+            "Given the user's query, generate three different sub-queries. "
+            "Each sub-query should focus on a distinct aspect or phrasing "
+            "of the original query. "
+            "Return the three sub-queries on a single line, separated by "
+            "semicolon(;). "
+            "Do NOT use numbers. "
+            "Do NOT answer the query. "
+            "Query: " + query + "\n"
+            "Your output:";
+}
+
 std::vector<std::string> rag_split_document(
         const std::string & document) {
     std::vector<std::string> chunks;

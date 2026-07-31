@@ -1821,6 +1821,12 @@ void server_models_routes::init_routes() {
         const std::string embedding_model =
                 json_value(body, "embedding_model", std::string());
 
+        const bool enable_query_expansion =
+                json_value(body, "enable_query_expansion", false);
+
+        const std::string expansion_model =
+                json_value(body, "expansion_model", std::string());
+
         const int top_k =
                 json_value(body, "top_k", 20);
 
@@ -1897,21 +1903,67 @@ void server_models_routes::init_routes() {
             return res;
         }
 
-        // Compute document and query embeddings through the Router's
-        // synchronous internal model interface.
+        // Compute document embeddings through the Router's synchronous
+        // internal model interface.
         const std::vector<std::vector<float>> doc_embeddings =
                 models.request_model_embeddings(
                         embedding_model,
                         source_chunks);
 
+        std::vector<std::string> retrieval_queries = {query};
+        std::vector<std::string> sub_queries;
+
+        std::string expansion_output;
+        std::string expansion_model_used;
+
+        if (enable_query_expansion) {
+            expansion_model_used = expansion_model.empty()
+                    ? generation_model
+                    : expansion_model;
+
+            const json expansion_request = {
+                {"prompt", build_query_expansion_prompt(query)},
+                {"n_predict", std::min(max_tokens, 96)},
+                {"temperature", 0.2F},
+                {"stream", false},
+            };
+
+            const json expansion_response =
+                    models.request_model_json(
+                            expansion_model_used,
+                            "/completion",
+                            expansion_request);
+
+            if (!expansion_response.contains("content") ||
+                !expansion_response["content"].is_string()) {
+                throw std::runtime_error(
+                        "query expansion model returned an invalid "
+                        "completion response");
+            }
+
+            expansion_output =
+                    expansion_response["content"].get<std::string>();
+
+            sub_queries =
+                    rag_split_sub_queries(expansion_output);
+
+            // Match the original pipeline's fallback behavior: when the
+            // expansion result cannot produce usable sub-queries, retrieve
+            // using the original query.
+            if (!sub_queries.empty()) {
+                retrieval_queries = sub_queries;
+            }
+        }
+
         const std::vector<std::vector<float>> query_embeddings =
                 models.request_model_embeddings(
                         embedding_model,
-                        {query});
+                        retrieval_queries);
 
-        if (query_embeddings.size() != 1) {
+        if (query_embeddings.size() != retrieval_queries.size()) {
             throw std::runtime_error(
-                    "query embedding request returned an invalid count");
+                    "query embedding response count does not match "
+                    "retrieval query count");
         }
 
         std::vector<std::size_t> source_indices;
@@ -1923,11 +1975,21 @@ void server_models_routes::init_routes() {
             source_indices.push_back(index);
         }
 
+        std::vector<std::vector<std::size_t>> per_query_hits;
+        per_query_hits.reserve(query_embeddings.size());
+
+        for (const auto & query_embedding : query_embeddings) {
+            per_query_hits.push_back(
+                    rag_search_inner_product(
+                            doc_embeddings,
+                            source_indices,
+                            query_embedding,
+                            static_cast<std::size_t>(top_k)));
+        }
+
         const std::vector<std::size_t> retrieved_indices =
-                rag_search_inner_product(
-                        doc_embeddings,
-                        source_indices,
-                        query_embeddings.front(),
+                rag_merge_subquery_hits(
+                        per_query_hits,
                         static_cast<std::size_t>(top_k));
 
         std::vector<std::string> context_chunks;
@@ -1976,17 +2038,25 @@ void server_models_routes::init_routes() {
                 generation_response["content"].get<std::string>();
 
         json response_data = {
-            {"answer",                  answer},
-            {"mode",                    "retrieval_augmented_sequential"},
-            {"generation_model",        generation_model},
-            {"embedding_model",         embedding_model},
-            {"query",                   query},
-            {"top_k",                   top_k},
-            {"source_chunk_count",      source_chunks.size()},
-            {"retrieved_chunk_count",   context_chunks.size()},
-            {"retrieved_indices",       retrieved_indices},
-            {"context_chunks",          context_chunks},
-            {"embedding_dimension",     doc_embeddings.front().size()},
+            {"answer", answer},
+            {"mode",
+             enable_query_expansion
+                     ? "query_expanded_retrieval_augmented_sequential"
+                     : "retrieval_augmented_sequential"},
+            {"generation_model", generation_model},
+            {"embedding_model", embedding_model},
+            {"enable_query_expansion", enable_query_expansion},
+            {"expansion_model", expansion_model_used},
+            {"expansion_output", expansion_output},
+            {"sub_queries", sub_queries},
+            {"retrieval_queries", retrieval_queries},
+            {"query", query},
+            {"top_k", top_k},
+            {"source_chunk_count", source_chunks.size()},
+            {"retrieved_chunk_count", context_chunks.size()},
+            {"retrieved_indices", retrieved_indices},
+            {"context_chunks", context_chunks},
+            {"embedding_dimension", doc_embeddings.front().size()},
         };
 
         // Preserve llama.cpp timing information when available. This will

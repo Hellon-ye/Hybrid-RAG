@@ -42,6 +42,14 @@ struct RagStageMetrics {
 
 std::string rag_trim(std::string value);
 
+std::vector<std::string> rag_split_sub_queries(
+        const std::string & expanded,
+        std::size_t max_subqueries = 3,
+        std::size_t max_subquery_chars = 128);
+
+std::string build_query_expansion_prompt(
+        const std::string & query);
+
 std::vector<std::string> rag_split_document(
         const std::string & document);
 
