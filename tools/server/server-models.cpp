@@ -1424,6 +1424,116 @@ std::vector<std::vector<float>> server_models::request_model_embeddings(
     return embeddings;
 }
 
+json server_models::request_model_rerank(
+        const std::string & model,
+        const std::string & query,
+        const std::vector<std::string> & documents,
+        std::size_t top_n) {
+    if (query.empty()) {
+        throw std::invalid_argument(
+                "reranking request contains an empty query");
+    }
+
+    if (documents.empty()) {
+        throw std::invalid_argument(
+                "reranking request contains no candidate documents");
+    }
+
+    if (top_n == 0) {
+        throw std::invalid_argument(
+                "reranking request top_n must be greater than zero");
+    }
+
+    const std::size_t requested_top_n =
+            std::min(top_n, documents.size());
+
+    const json request_body = {
+        {"query", query},
+        {"documents", documents},
+        {"top_n", requested_top_n},
+    };
+
+    const json response = request_model_json(
+            model,
+            "/v1/rerank",
+            request_body);
+
+    if (!response.contains("results") ||
+        !response["results"].is_array()) {
+        throw std::runtime_error(
+                "reranking model returned a response without "
+                "a results array");
+    }
+
+    const json & results = response["results"];
+
+    if (results.empty()) {
+        throw std::runtime_error(
+                "reranking model returned no ranked results");
+    }
+
+    if (results.size() > requested_top_n) {
+        throw std::runtime_error(
+                "reranking model returned more results than requested");
+    }
+
+    json normalized_results = json::array();
+    std::vector<bool> seen_indices(documents.size(), false);
+
+    for (std::size_t rank = 0; rank < results.size(); ++rank) {
+        const json & item = results.at(rank);
+
+        if (!item.is_object() ||
+            !item.contains("index") ||
+            !item["index"].is_number_integer()) {
+            throw std::runtime_error(
+                    "reranking response item " +
+                    std::to_string(rank) +
+                    " does not contain an integer index");
+        }
+
+        if (!item.contains("relevance_score") ||
+            !item["relevance_score"].is_number()) {
+            throw std::runtime_error(
+                    "reranking response item " +
+                    std::to_string(rank) +
+                    " does not contain a relevance_score");
+        }
+
+        const long long signed_index =
+                item["index"].get<long long>();
+
+        if (signed_index < 0) {
+            throw std::runtime_error(
+                    "reranking response contains a negative index");
+        }
+
+        const std::size_t candidate_index =
+                static_cast<std::size_t>(signed_index);
+
+        if (candidate_index >= documents.size()) {
+            throw std::runtime_error(
+                    "reranking response contains an out-of-range index");
+        }
+
+        if (seen_indices[candidate_index]) {
+            throw std::runtime_error(
+                    "reranking response contains a duplicate index");
+        }
+
+        seen_indices[candidate_index] = true;
+
+        normalized_results.push_back({
+            {"index", candidate_index},
+            {"relevance_score",
+             item["relevance_score"].get<float>()},
+        });
+    }
+
+    return normalized_results;
+}
+
+
 void server_models::handle_child_state(const std::string & name, const std::string & raw_input) {
     server_state state;
     json payload;
@@ -1821,6 +1931,9 @@ void server_models_routes::init_routes() {
         const std::string embedding_model =
                 json_value(body, "embedding_model", std::string());
 
+        const std::string rerank_model =
+                json_value(body, "rerank_model", std::string());
+
         const bool enable_query_expansion =
                 json_value(body, "enable_query_expansion", false);
 
@@ -1829,6 +1942,9 @@ void server_models_routes::init_routes() {
 
         const int top_k =
                 json_value(body, "top_k", 20);
+
+        const int top_n =
+                json_value(body, "top_n", 5);
 
         const int max_tokens =
                 json_value(body, "max_tokens", 64);
@@ -1877,6 +1993,15 @@ void server_models_routes::init_routes() {
                     res,
                     format_error_response(
                             "top_k must be greater than zero",
+                            ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        if (top_n <= 0) {
+            res_err(
+                    res,
+                    format_error_response(
+                            "top_n must be greater than zero",
                             ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
@@ -1992,8 +2117,8 @@ void server_models_routes::init_routes() {
                         per_query_hits,
                         static_cast<std::size_t>(top_k));
 
-        std::vector<std::string> context_chunks;
-        context_chunks.reserve(retrieved_indices.size());
+        std::vector<std::string> retrieved_chunks;
+        retrieved_chunks.reserve(retrieved_indices.size());
 
         for (const std::size_t index : retrieved_indices) {
             if (index >= source_chunks.size()) {
@@ -2001,12 +2126,73 @@ void server_models_routes::init_routes() {
                         "retrieval returned an out-of-range chunk index");
             }
 
-            context_chunks.push_back(source_chunks[index]);
+            retrieved_chunks.push_back(source_chunks[index]);
+        }
+
+        if (retrieved_chunks.empty()) {
+            throw std::runtime_error(
+                    "retrieval produced no candidate chunks");
+        }
+
+        const bool enable_reranking =
+                !rerank_model.empty();
+
+        std::vector<std::size_t> reranked_indices =
+                retrieved_indices;
+
+        json rerank_results = json::array();
+
+        if (enable_reranking) {
+            const json ranked_candidates =
+                    models.request_model_rerank(
+                            rerank_model,
+                            query,
+                            retrieved_chunks,
+                            static_cast<std::size_t>(top_n));
+
+            reranked_indices.clear();
+            reranked_indices.reserve(ranked_candidates.size());
+
+            for (const json & ranked_item : ranked_candidates) {
+                const std::size_t candidate_index =
+                        ranked_item["index"].get<std::size_t>();
+
+                if (candidate_index >= retrieved_indices.size()) {
+                    throw std::runtime_error(
+                            "reranker returned an out-of-range "
+                            "candidate index");
+                }
+
+                const std::size_t source_index =
+                        retrieved_indices[candidate_index];
+
+                reranked_indices.push_back(source_index);
+
+                rerank_results.push_back({
+                    {"candidate_index", candidate_index},
+                    {"source_index", source_index},
+                    {"relevance_score",
+                     ranked_item["relevance_score"]},
+                });
+            }
+        }
+
+        std::vector<std::string> context_chunks;
+        context_chunks.reserve(reranked_indices.size());
+
+        for (const std::size_t source_index : reranked_indices) {
+            if (source_index >= source_chunks.size()) {
+                throw std::runtime_error(
+                        "reranking produced an out-of-range "
+                        "source chunk index");
+            }
+
+            context_chunks.push_back(source_chunks[source_index]);
         }
 
         if (context_chunks.empty()) {
             throw std::runtime_error(
-                    "retrieval produced no context chunks");
+                    "reranking produced no context chunks");
         }
 
         // The current baseline uses a Base model rather than an
@@ -2037,14 +2223,25 @@ void server_models_routes::init_routes() {
         const std::string answer =
                 generation_response["content"].get<std::string>();
 
+        const std::string mode =
+                enable_query_expansion
+                        ? (enable_reranking
+                                   ? "query_expanded_reranked_"
+                                     "retrieval_augmented_sequential"
+                                   : "query_expanded_"
+                                     "retrieval_augmented_sequential")
+                        : (enable_reranking
+                                   ? "reranked_"
+                                     "retrieval_augmented_sequential"
+                                   : "retrieval_augmented_sequential");
+
         json response_data = {
             {"answer", answer},
-            {"mode",
-             enable_query_expansion
-                     ? "query_expanded_retrieval_augmented_sequential"
-                     : "retrieval_augmented_sequential"},
+            {"mode", mode},
             {"generation_model", generation_model},
             {"embedding_model", embedding_model},
+            {"enable_reranking", enable_reranking},
+            {"rerank_model", rerank_model},
             {"enable_query_expansion", enable_query_expansion},
             {"expansion_model", expansion_model_used},
             {"expansion_output", expansion_output},
@@ -2052,9 +2249,14 @@ void server_models_routes::init_routes() {
             {"retrieval_queries", retrieval_queries},
             {"query", query},
             {"top_k", top_k},
+            {"top_n", top_n},
             {"source_chunk_count", source_chunks.size()},
-            {"retrieved_chunk_count", context_chunks.size()},
+            {"retrieved_chunk_count", retrieved_chunks.size()},
             {"retrieved_indices", retrieved_indices},
+            {"retrieved_chunks", retrieved_chunks},
+            {"reranked_chunk_count", context_chunks.size()},
+            {"reranked_indices", reranked_indices},
+            {"rerank_results", rerank_results},
             {"context_chunks", context_chunks},
             {"embedding_dimension", doc_embeddings.front().size()},
         };

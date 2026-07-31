@@ -262,6 +262,15 @@ public:
             const std::string & model,
             const std::vector<std::string> & inputs);
 
+    // Send candidate documents to a reranking model and return normalized
+    // candidate-local indices with relevance scores.
+    json request_model_rerank(
+            const std::string & model,
+            const std::string & query,
+            const std::vector<std::string> & documents,
+            std::size_t top_n);
+
+
     // handle message sent from server_child::notify_to_router()
     // raw input must starts with CMD_CHILD_TO_ROUTER_STATE, followed by a JSON string
     // this function is not thread-safe, must be called from instance's monitoring thread

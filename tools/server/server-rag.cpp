@@ -158,11 +158,71 @@ std::vector<std::string> rag_split_sub_queries(
         sub_queries.push_back(std::move(token));
     };
 
-    for (const char ch : normalized) {
+    const auto numbered_marker_end =
+            [&](std::size_t position) -> std::size_t {
+        if (position >= normalized.size() ||
+            std::isdigit(
+                    static_cast<unsigned char>(
+                            normalized[position])) == 0) {
+            return position;
+        }
+
+        std::size_t digit_end = position;
+
+        while (digit_end < normalized.size() &&
+               std::isdigit(
+                       static_cast<unsigned char>(
+                               normalized[digit_end])) != 0) {
+            ++digit_end;
+        }
+
+        if (digit_end >= normalized.size()) {
+            return position;
+        }
+
+        if (normalized[digit_end] == '.' ||
+            normalized[digit_end] == ')' ||
+            normalized[digit_end] == ':') {
+            return digit_end + 1;
+        }
+
+        static const std::string chinese_separator = "、";
+        static const std::string fullwidth_right_parenthesis = "）";
+        static const std::string fullwidth_period = "．";
+
+        if (normalized.compare(
+                    digit_end,
+                    chinese_separator.size(),
+                    chinese_separator) == 0) {
+            return digit_end + chinese_separator.size();
+        }
+
+        if (normalized.compare(
+                    digit_end,
+                    fullwidth_right_parenthesis.size(),
+                    fullwidth_right_parenthesis) == 0) {
+            return digit_end + fullwidth_right_parenthesis.size();
+        }
+
+        if (normalized.compare(
+                    digit_end,
+                    fullwidth_period.size(),
+                    fullwidth_period) == 0) {
+            return digit_end + fullwidth_period.size();
+        }
+
+        return position;
+    };
+
+    for (std::size_t position = 0;
+         position < normalized.size();) {
+        const char ch = normalized[position];
+
         // Accept both the original semicolon format and multiline lists.
         if (ch == ';' || ch == '\n' || ch == '\r') {
             push_token(std::move(current));
             current.clear();
+            ++position;
 
             if (sub_queries.size() >= max_subqueries) {
                 break;
@@ -171,7 +231,45 @@ std::vector<std::string> rag_split_sub_queries(
             continue;
         }
 
+        // Some Base models emit a numbered list on one line:
+        // "1. first query 2. second query 3. third query".
+        // Detect an inline numbered marker following whitespace and split
+        // before it. The marker remains at the start of the next token and
+        // is removed later by rag_strip_subquery_marker().
+        if (!current.empty() &&
+            std::isdigit(
+                    static_cast<unsigned char>(ch)) != 0 &&
+            position > 0 &&
+            std::isspace(
+                    static_cast<unsigned char>(
+                            normalized[position - 1])) != 0) {
+            const std::size_t marker_end =
+                    numbered_marker_end(position);
+
+            if (marker_end > position &&
+                marker_end < normalized.size() &&
+                std::isspace(
+                        static_cast<unsigned char>(
+                                normalized[marker_end])) != 0) {
+                push_token(std::move(current));
+                current.clear();
+
+                if (sub_queries.size() >= max_subqueries) {
+                    break;
+                }
+
+                current.append(
+                        normalized,
+                        position,
+                        marker_end - position);
+
+                position = marker_end;
+                continue;
+            }
+        }
+
         current.push_back(ch);
+        ++position;
     }
 
     if (sub_queries.size() < max_subqueries) {
