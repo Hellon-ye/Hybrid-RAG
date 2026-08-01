@@ -30,11 +30,10 @@ struct RagRequest {
 };
 
 struct RagStageMetrics {
-    std::size_t indexing_ms = 0;
-    std::size_t query_expand_ms = 0;
+    std::size_t document_embedding_ms = 0;
+    std::size_t query_expansion_ms = 0;
     std::size_t query_embedding_ms = 0;
-    std::size_t embedding_ms = 0;
-    std::size_t searching_ms = 0;
+    std::size_t vector_search_ms = 0;
     std::size_t reranking_ms = 0;
     std::size_t generation_ms = 0;
     std::size_t total_ms = 0;
