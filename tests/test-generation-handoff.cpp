@@ -2,6 +2,7 @@
 #include "common.h"
 #include "log.h"
 #include "server-generation-handoff.h"
+#include "server-generation-executor.h"
 
 #include <algorithm>
 #include <clocale>
@@ -188,12 +189,27 @@ bool run_reference_handoff_test(
     llama_context_ptr producer_ctx {
         llama_init_from_model(model, context_params)
     };
-    llama_context_ptr consumer_ctx {
-        llama_init_from_model(model, context_params)
-    };
 
-    if (!baseline_ctx || !producer_ctx || !consumer_ctx) {
-        LOG_ERR("%s: failed to create the three CPU contexts\n", __func__);
+    if (!baseline_ctx || !producer_ctx) {
+        LOG_ERR("%s: failed to create baseline or producer Context\n", __func__);
+        return false;
+    }
+
+    std::unique_ptr<server_generation_decode_executor>
+            consumer_executor;
+
+    try {
+        consumer_executor =
+                std::make_unique<
+                        server_generation_decode_executor>(
+                            model,
+                            context_params,
+                            0);
+    } catch (const std::exception & error) {
+        LOG_ERR(
+                "%s: failed to create Decode executor: %s\n",
+                __func__,
+                error.what());
         return false;
     }
 
@@ -259,32 +275,12 @@ bool run_reference_handoff_test(
             handoff.next_position);
 
     if (!run_integrity_tests(
-                consumer_ctx.get(),
+                consumer_executor->context(),
                 handoff)) {
         return false;
     }
 
-    const std::size_t restored =
-            server_generation_handoff_restore(
-                    consumer_ctx.get(),
-                    0,
-                    handoff);
-
-    if (restored != handoff.sequence_state.size()) {
-        LOG_ERR(
-                "%s: restored size mismatch, got=%zu expected=%zu\n",
-                __func__,
-                restored,
-                handoff.sequence_state.size());
-        return false;
-    }
-
-    // common_sampler_init() accepts a mutable sampling configuration.
-    // Use independent copies so both samplers begin from identical,
-    // independently initialized state.
     common_params_sampling baseline_sampling =
-            params.sampling;
-    common_params_sampling consumer_sampling =
             params.sampling;
 
     common_sampler_unique_ptr baseline_sampler(
@@ -293,24 +289,15 @@ bool run_reference_handoff_test(
                     baseline_sampling),
             &common_sampler_free);
 
-    common_sampler_unique_ptr consumer_sampler(
-            common_sampler_init(
-                    model,
-                    consumer_sampling),
-            &common_sampler_free);
-
-    if (!baseline_sampler || !consumer_sampler) {
-        LOG_ERR("%s: failed to initialize samplers\n", __func__);
+    if (!baseline_sampler) {
+        LOG_ERR("%s: failed to initialize baseline sampler\n", __func__);
         return false;
     }
 
-    // Both paths begin with the same Prompt-only sampler history.
+    // The baseline and executor both begin with the same Prompt-only
+    // sampler history, but the executor owns its sampler internally.
     server_generation_handoff_prepare_sampler(
             baseline_sampler.get(),
-            handoff);
-
-    server_generation_handoff_prepare_sampler(
-            consumer_sampler.get(),
             handoff);
 
     llama_token baseline_token =
@@ -319,19 +306,22 @@ bool run_reference_handoff_test(
                     baseline_ctx.get(),
                     final_output_index);
 
-    llama_token consumer_token =
-            server_generation_handoff_sample_first_token(
-                    consumer_sampler.get(),
-                    handoff);
+    llama_token consumer_token;
+
+    try {
+        consumer_token =
+                consumer_executor->begin(handoff);
+    } catch (const std::exception & error) {
+        LOG_ERR(
+                "%s: Decode executor begin failed: %s\n",
+                __func__,
+                error.what());
+        return false;
+    }
 
     common_sampler_accept(
             baseline_sampler.get(),
             baseline_token,
-            true);
-
-    common_sampler_accept(
-            consumer_sampler.get(),
-            consumer_token,
             true);
 
     if (baseline_token != consumer_token) {
@@ -366,11 +356,6 @@ bool run_reference_handoff_test(
                     baseline_ctx.get(),
                     baseline_token,
                     position,
-                    0) ||
-                !decode_generated_token(
-                    consumer_ctx.get(),
-                    consumer_token,
-                    position,
                     0)) {
             return false;
         }
@@ -381,21 +366,21 @@ bool run_reference_handoff_test(
                         baseline_ctx.get(),
                         0);
 
-        consumer_token =
-                common_sampler_sample(
-                        consumer_sampler.get(),
-                        consumer_ctx.get(),
-                        0);
-
         common_sampler_accept(
                 baseline_sampler.get(),
                 baseline_token,
                 true);
 
-        common_sampler_accept(
-                consumer_sampler.get(),
-                consumer_token,
-                true);
+        try {
+            consumer_token =
+                    consumer_executor->decode_next();
+        } catch (const std::exception & error) {
+            LOG_ERR(
+                    "%s: Decode executor step failed: %s\n",
+                    __func__,
+                    error.what());
+            return false;
+        }
 
         baseline_output.push_back(baseline_token);
         consumer_output.push_back(consumer_token);
