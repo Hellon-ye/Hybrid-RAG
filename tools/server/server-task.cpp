@@ -79,6 +79,9 @@ json task_params::to_json(bool only_metrics) const {
             {"speculative.types",         common_speculative_type_name_str(speculative.types)},
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
+            {"generation_handoff",         generation_handoff},
+            {"generation_prefill_backend", generation_prefill_backend},
+            {"generation_decode_backend",  generation_decode_backend},
             {"backend_sampling",          sampling.backend_sampling},
             {"lora",                      lora},
         };
@@ -136,6 +139,9 @@ json task_params::to_json(bool only_metrics) const {
         {"speculative.types",         common_speculative_type_name_str(speculative.types)},
         {"timings_per_token",         timings_per_token},
         {"post_sampling_probs",       post_sampling_probs},
+        {"generation_handoff",         generation_handoff},
+        {"generation_prefill_backend", generation_prefill_backend},
+        {"generation_decode_backend",  generation_decode_backend},
         {"backend_sampling",          sampling.backend_sampling},
         {"lora",                      lora},
     };

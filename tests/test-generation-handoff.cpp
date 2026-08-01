@@ -3,6 +3,7 @@
 #include "log.h"
 #include "server-generation-handoff.h"
 #include "server-generation-executor.h"
+#include "server-schema.h"
 
 #include <algorithm>
 #include <clocale>
@@ -169,6 +170,178 @@ bool run_integrity_tests(
                     })) {
             return false;
         }
+    }
+
+    return true;
+}
+
+bool run_generation_schema_tests(
+        llama_model * model,
+        const common_params & params_base) {
+    const llama_vocab * vocab =
+            llama_model_get_vocab(model);
+
+    if (vocab == nullptr) {
+        LOG_ERR("%s: model has no vocabulary\n", __func__);
+        return false;
+    }
+
+    const std::vector<llama_logit_bias> logit_bias_eog;
+
+    auto parse_request =
+            [&](const nlohmann::ordered_json & request) {
+                return server_schema::eval_llama_cmpl_schema(
+                        vocab,
+                        params_base,
+                        256,
+                        logit_bias_eog,
+                        request);
+            };
+
+    auto check_serialized_route =
+            [&](const nlohmann::ordered_json & serialized,
+                    const char * mode) {
+                if (!serialized.contains("generation_handoff") ||
+                        !serialized.contains(
+                                "generation_prefill_backend") ||
+                        !serialized.contains(
+                                "generation_decode_backend")) {
+                    LOG_ERR(
+                            "%s: Generation route missing from %s JSON\n",
+                            __func__,
+                            mode);
+                    return false;
+                }
+
+                if (!serialized.at(
+                            "generation_handoff").get<bool>() ||
+                        serialized.at(
+                            "generation_prefill_backend")
+                                .get<std::string>() != "cpu" ||
+                        serialized.at(
+                            "generation_decode_backend")
+                                .get<std::string>() != "cpu") {
+                    LOG_ERR(
+                            "%s: incorrect Generation route in %s JSON\n",
+                            __func__,
+                            mode);
+                    return false;
+                }
+
+                return true;
+            };
+
+    {
+        const nlohmann::ordered_json request = {
+            { "generation_handoff", true },
+            { "generation_prefill_backend", "cpu" },
+            { "generation_decode_backend", "cpu" },
+            { "backend_sampling", false },
+        };
+
+        const task_params parsed =
+                parse_request(request);
+
+        if (!parsed.generation_handoff ||
+                parsed.generation_prefill_backend != "cpu" ||
+                parsed.generation_decode_backend != "cpu") {
+            LOG_ERR(
+                    "%s: CPU Generation route parsed incorrectly\n",
+                    __func__);
+            return false;
+        }
+
+        if (!check_serialized_route(
+                    parsed.to_json(false),
+                    "full") ||
+                !check_serialized_route(
+                    parsed.to_json(true),
+                    "metrics")) {
+            return false;
+        }
+
+        LOG_INF(
+                "PASS: CPU Prefill -> CPU Decode schema route\n");
+    }
+
+    {
+        const nlohmann::ordered_json request = {
+            { "generation_handoff", true },
+            { "generation_prefill_backend", "auto" },
+            { "generation_decode_backend", "auto" },
+            { "backend_sampling", false },
+        };
+
+        const task_params parsed =
+                parse_request(request);
+
+        if (parsed.generation_prefill_backend != "cpu" ||
+                parsed.generation_decode_backend != "cpu") {
+            LOG_ERR(
+                    "%s: AUTO route did not resolve to CPU\n",
+                    __func__);
+            return false;
+        }
+
+        LOG_INF(
+                "PASS: AUTO route resolved to registered CPU backend\n");
+    }
+
+    if (!expect_exception(
+                "unknown Generation backend",
+                [&]() {
+                    const nlohmann::ordered_json request = {
+                        { "generation_handoff", true },
+                        { "generation_prefill_backend", "cuda" },
+                        { "generation_decode_backend", "cpu" },
+                    };
+
+                    (void) parse_request(request);
+                })) {
+        return false;
+    }
+
+    if (!expect_exception(
+                "unregistered NPU Prefill backend",
+                [&]() {
+                    const nlohmann::ordered_json request = {
+                        { "generation_handoff", true },
+                        { "generation_prefill_backend", "npu" },
+                        { "generation_decode_backend", "cpu" },
+                    };
+
+                    (void) parse_request(request);
+                })) {
+        return false;
+    }
+
+    if (!expect_exception(
+                "unregistered NPU Decode backend",
+                [&]() {
+                    const nlohmann::ordered_json request = {
+                        { "generation_handoff", true },
+                        { "generation_prefill_backend", "cpu" },
+                        { "generation_decode_backend", "npu" },
+                    };
+
+                    (void) parse_request(request);
+                })) {
+        return false;
+    }
+
+    if (!expect_exception(
+                "backend sampling with Generation handoff",
+                [&]() {
+                    const nlohmann::ordered_json request = {
+                        { "generation_handoff", true },
+                        { "generation_prefill_backend", "cpu" },
+                        { "generation_decode_backend", "cpu" },
+                        { "backend_sampling", true },
+                    };
+
+                    (void) parse_request(request);
+                })) {
+        return false;
     }
 
     return true;
@@ -458,6 +631,12 @@ int main(int argc, char ** argv) {
 
     GGML_ASSERT(
             llama_init->context() == nullptr);
+
+    if (!run_generation_schema_tests(
+                model,
+                params)) {
+        return 1;
+    }
 
     auto tokenizer_params =
             common_context_params_to_llama(params);
