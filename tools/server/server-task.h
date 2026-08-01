@@ -52,6 +52,16 @@ struct task_params {
     bool include_usage   = false;
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
     bool return_tokens   = false;
+
+    // Generation Prefill/Decode separation.
+    //
+    // When enabled, the server exports Prompt sequence memory and the
+    // final Prefill logits before any generated token is sampled.
+    // The Decode backend owns the sampler and RNG from the first token.
+    bool generation_handoff = false;
+
+    std::string generation_prefill_backend = "cpu";
+    std::string generation_decode_backend  = "cpu";
     bool return_progress = false;
 
     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables

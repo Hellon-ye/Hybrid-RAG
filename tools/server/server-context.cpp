@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-generation-handoff.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -215,6 +216,10 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // Owns the complete state captured at the Prefill/Decode boundary.
+    // It is request-scoped and is destroyed by reset()/release().
+    std::unique_ptr<server_generation_handoff> generation_handoff;
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -312,6 +317,8 @@ struct server_slot {
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
+
+        generation_handoff.reset();
 
         // clear speculative decoding stats
         n_draft_total = 0;
@@ -3740,6 +3747,93 @@ private:
 
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
+
+            // Export the formal Prefill/Decode handoff before the first sampling operation.
+            //
+            // Sequence memory contains Prompt state only, final-position
+            // logits are available, and the sampler RNG has not produced
+            // any generated token.
+            if (slot.n_decoded == 0 &&
+                    slot.task->params.generation_handoff) {
+                if (slot.can_speculate()) {
+                    throw std::runtime_error(
+                            "generation handoff is not compatible with "
+                            "speculative decoding");
+                }
+
+                if (slot.prompt.tokens.has_mtmd) {
+                    throw std::runtime_error(
+                            "generation handoff does not currently support "
+                            "multimodal sequence state");
+                }
+
+                const llama_model * model =
+                        llama_get_model(slot.ctx_tgt);
+                const llama_vocab * vocab =
+                        llama_model_get_vocab(model);
+
+                if (vocab == nullptr) {
+                    throw std::runtime_error(
+                            "generation context has no vocabulary");
+                }
+
+                const int32_t n_vocab =
+                        llama_vocab_n_tokens(vocab);
+
+                const float * final_logits =
+                        llama_get_logits_ith(
+                                slot.ctx_tgt,
+                                tok_idx);
+
+                if (final_logits == nullptr) {
+                    throw std::runtime_error(
+                            "failed to obtain final Prefill logits");
+                }
+
+                slot.generation_handoff =
+                        std::make_unique<
+                                server_generation_handoff>(
+                                server_generation_handoff_export(
+                                        slot.ctx_tgt,
+                                        slot.id,
+                                        static_cast<std::uint64_t>(
+                                                slot.task->id),
+                                        server_generation_model_identity(
+                                                slot.ctx_tgt),
+                                        server_generation_runtime_identity(
+                                                slot.ctx_tgt),
+                                        slot.task->params
+                                                .generation_prefill_backend,
+                                        slot.prompt.tokens
+                                                .get_text_tokens(),
+                                        final_logits,
+                                        static_cast<std::size_t>(
+                                                n_vocab),
+                                        slot.prompt.tokens.pos_next(),
+                                        slot.task->params.sampling));
+
+                SLT_INF(
+                        slot,
+                        "generation handoff exported before sampling: "
+                        "request_id=%" PRIu64 ", "
+                        "source_seq_id=%d, "
+                        "prompt_tokens=%zu, "
+                        "next_position=%d, "
+                        "state_bytes=%zu, "
+                        "logits_count=%zu, "
+                        "producer_backend=%s\n",
+                        slot.generation_handoff->request_id,
+                        slot.generation_handoff->source_seq_id,
+                        slot.generation_handoff
+                                ->prompt_tokens.size(),
+                        slot.generation_handoff->next_position,
+                        slot.generation_handoff
+                                ->sequence_state.size(),
+                        slot.generation_handoff
+                                ->final_logits.size(),
+                        slot.generation_handoff
+                                ->producer_backend.c_str());
+            }
 
             llama_token id;
             {
