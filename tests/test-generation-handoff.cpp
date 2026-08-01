@@ -344,6 +344,22 @@ bool run_generation_schema_tests(
         return false;
     }
 
+    if (!expect_exception(
+                "token probabilities with Generation handoff",
+                [&]() {
+                    const nlohmann::ordered_json request = {
+                        { "generation_handoff", true },
+                        { "generation_prefill_backend", "cpu" },
+                        { "generation_decode_backend", "cpu" },
+                        { "backend_sampling", false },
+                        { "n_probs", 5 },
+                    };
+
+                    (void) parse_request(request);
+                })) {
+        return false;
+    }
+
     return true;
 }
 

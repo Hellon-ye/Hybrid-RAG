@@ -626,6 +626,12 @@ task_params eval_llama_cmpl_schema(
                         "Field 'backend_sampling': Generation handoff "
                         "requires CPU-owned llama.cpp sampling");
             }
+
+            if (params.sampling.n_probs > 0) {
+                throw std::invalid_argument(
+                        "Field 'n_probs': Generation handoff does not "
+                        "yet expose Decode-side token probabilities");
+            }
         }
     }
 
