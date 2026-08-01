@@ -602,10 +602,14 @@ task_params eval_llama_cmpl_schema(
                 params.generation_decode_backend = "cpu";
             }
 
-            if (params.generation_prefill_backend == "npu") {
+            // NPU Prefill uses the normal llama.cpp Context backed by
+            // GGML HTP. Model/backend availability is validated at runtime,
+            // because the request schema has no access to the loaded model.
+            if (params.generation_prefill_backend != "cpu" &&
+                    params.generation_prefill_backend != "npu") {
                 throw std::invalid_argument(
                         "Field 'generation_prefill_backend': "
-                        "NPU Generation Prefill executor is not registered");
+                        "expected CPU or NPU Generation Prefill");
             }
 
             if (params.generation_decode_backend == "npu") {
@@ -614,11 +618,10 @@ task_params eval_llama_cmpl_schema(
                         "NPU Generation Decode executor is not registered");
             }
 
-            if (params.generation_prefill_backend != "cpu" ||
-                    params.generation_decode_backend != "cpu") {
+            if (params.generation_decode_backend != "cpu") {
                 throw std::invalid_argument(
                         "Generation handoff currently requires "
-                        "CPU Prefill -> CPU Decode");
+                        "CPU Generation Decode");
             }
 
             if (params.sampling.backend_sampling) {

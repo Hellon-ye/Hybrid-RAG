@@ -952,6 +952,41 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    static bool model_uses_backend_registry(
+            const llama_model * model,
+            const char * registry_name) {
+        if (model == nullptr || registry_name == nullptr) {
+            return false;
+        }
+
+        const int32_t n_devices =
+                llama_model_n_devices(model);
+
+        for (int32_t i = 0; i < n_devices; ++i) {
+            ggml_backend_dev_t device =
+                    llama_model_get_device(model, i);
+
+            if (device == nullptr) {
+                continue;
+            }
+
+            ggml_backend_reg_t registry =
+                    ggml_backend_dev_backend_reg(device);
+
+            const char * name =
+                    registry != nullptr
+                        ? ggml_backend_reg_name(registry)
+                        : nullptr;
+
+            if (name != nullptr &&
+                    std::string(name) == registry_name) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     void destroy() {
         // Decode executors contain Contexts that reference the dedicated
         // CPU Decode model. Destroy every executor before releasing that
@@ -4015,6 +4050,40 @@ private:
                             "generation context has no vocabulary");
                 }
 
+                const std::string & prefill_backend =
+                        slot.task->params
+                                .generation_prefill_backend;
+
+                const bool producer_uses_htp =
+                        model_uses_backend_registry(
+                                model,
+                                "HTP");
+
+                if (prefill_backend == "npu") {
+                    if (!producer_uses_htp) {
+                        throw std::runtime_error(
+                                "generation_prefill_backend=npu "
+                                "requires the Producer model to be "
+                                "loaded with an HTP backend device");
+                    }
+
+                    if (generation_decode_model_cpu == nullptr) {
+                        throw std::runtime_error(
+                                "NPU Prefill -> CPU Decode requires "
+                                "--generation-decode-cpu");
+                    }
+                } else if (prefill_backend == "cpu") {
+                    if (producer_uses_htp) {
+                        throw std::runtime_error(
+                                "generation_prefill_backend=cpu "
+                                "does not match an HTP-backed "
+                                "Producer model");
+                    }
+                } else {
+                    throw std::runtime_error(
+                            "unsupported Generation Prefill backend");
+                }
+
                 const int32_t n_vocab =
                         llama_vocab_n_tokens(vocab);
 
@@ -4092,10 +4161,26 @@ private:
                         static_cast<uint32_t>(slot.n_ctx);
                 decode_context_params.n_seq_max = 1;
 
-                llama_model * decode_model =
-                        generation_decode_model_cpu != nullptr
-                            ? generation_decode_model_cpu
-                            : model_tgt;
+                llama_model * decode_model = nullptr;
+
+                if (prefill_backend == "npu") {
+                    // The dedicated CPU Model is mandatory for the formal
+                    // NPU Prefill -> CPU Decode route. Never fall back to
+                    // the HTP-backed Producer Model.
+                    decode_model = generation_decode_model_cpu;
+                } else {
+                    // CPU Prefill -> CPU Decode remains the permanent
+                    // reference validation path.
+                    decode_model =
+                            generation_decode_model_cpu != nullptr
+                                ? generation_decode_model_cpu
+                                : model_tgt;
+                }
+
+                if (decode_model == nullptr) {
+                    throw std::runtime_error(
+                            "Generation Decode model is unavailable");
+                }
 
                 slot.generation_decode_executor =
                         std::make_unique<

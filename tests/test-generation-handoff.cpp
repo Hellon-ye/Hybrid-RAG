@@ -301,18 +301,29 @@ bool run_generation_schema_tests(
         return false;
     }
 
-    if (!expect_exception(
-                "unregistered NPU Prefill backend",
-                [&]() {
-                    const nlohmann::ordered_json request = {
-                        { "generation_handoff", true },
-                        { "generation_prefill_backend", "npu" },
-                        { "generation_decode_backend", "cpu" },
-                    };
+    {
+        const nlohmann::ordered_json request = {
+            { "generation_handoff", true },
+            { "generation_prefill_backend", "npu" },
+            { "generation_decode_backend", "cpu" },
+            { "backend_sampling", false },
+        };
 
-                    (void) parse_request(request);
-                })) {
-        return false;
+        const task_params parsed =
+                parse_request(request);
+
+        if (!parsed.generation_handoff ||
+                parsed.generation_prefill_backend != "npu" ||
+                parsed.generation_decode_backend != "cpu") {
+            LOG_ERR(
+                    "%s: NPU Prefill -> CPU Decode route parsed "
+                    "incorrectly\n",
+                    __func__);
+            return false;
+        }
+
+        LOG_INF(
+                "PASS: NPU Prefill -> CPU Decode schema route\n");
     }
 
     if (!expect_exception(
