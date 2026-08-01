@@ -901,6 +901,11 @@ private:
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
 
+    // Optional service-level CPU-only model used by request-level
+    // Generation Decode executors. Executors hold non-owning references.
+    common_init_result_ptr generation_decode_init_cpu;
+    llama_model * generation_decode_model_cpu = nullptr;
+
     llama_context * ctx_tgt = nullptr;
 
     server_batch batch;
@@ -948,11 +953,22 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // Decode executors contain Contexts that reference the dedicated
+        // CPU Decode model. Destroy every executor before releasing that
+        // model.
+        for (auto & slot : slots) {
+            slot.generation_decode_executor.reset();
+            slot.generation_handoff.reset();
+        }
+
         spec.reset();
         spec_init.reset();
 
         ctx_dft   = nullptr;
         model_dft = nullptr;
+
+        generation_decode_model_cpu = nullptr;
+        generation_decode_init_cpu.reset();
 
         llama_init.reset();
 
@@ -1012,9 +1028,12 @@ private:
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
-        load_progress_data load_progress_text  (this, "text_model");
-        load_progress_data load_progress_mmproj(this, "mmproj_model");
-        load_progress_data load_progress_spec  (this, "spec_model");
+        load_progress_data load_progress_text      (this, "text_model");
+        load_progress_data load_progress_mmproj    (this, "mmproj_model");
+        load_progress_data load_progress_spec      (this, "spec_model");
+        load_progress_data load_progress_decode_cpu(
+                this,
+                "generation_decode_cpu_model");
 
         const bool is_resume = sleeping;
 
@@ -1022,6 +1041,8 @@ private:
         params_base.n_outputs_max = server_n_outputs_max(params_base);
 
         const bool has_mmproj = !params.mmproj.path.empty();
+        const bool has_generation_decode_cpu =
+                params.generation_decode_cpu;
         const bool has_draft = params.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
@@ -1030,15 +1051,19 @@ private:
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
+            if (has_generation_decode_cpu) {
+                stages.push_back("generation_decode_cpu_model");
+            }
             if (has_spec) {
                 stages.push_back("spec_model");
             }
             if (has_mmproj) {
                 stages.push_back("mmproj_model");
             }
-            load_progress_text.stages   = stages;
-            load_progress_mmproj.stages = stages;
-            load_progress_spec.stages   = stages;
+            load_progress_text.stages      = stages;
+            load_progress_decode_cpu.stages = stages;
+            load_progress_mmproj.stages    = stages;
+            load_progress_spec.stages      = stages;
 
             // trigger 0% progress
             load_progress_callback(0.0f, &load_progress_text);
@@ -1164,6 +1189,71 @@ private:
         if (model_tgt == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
             return false;
+        }
+
+        if (params_base.generation_decode_cpu) {
+            ggml_backend_dev_t cpu_device =
+                    ggml_backend_dev_by_type(
+                            GGML_BACKEND_DEVICE_TYPE_CPU);
+
+            if (cpu_device == nullptr) {
+                SRV_ERR(
+                        "%s",
+                        "failed to locate CPU backend device for "
+                        "Generation Decode\n");
+                return false;
+            }
+
+            common_params params_decode_cpu = params_base;
+
+            // An explicit, null-terminated CPU device list prevents the
+            // model loader from auto-selecting Hexagon or another
+            // accelerator. n_gpu_layers=0 keeps every model tensor on CPU.
+            params_decode_cpu.devices = {cpu_device, nullptr};
+            params_decode_cpu.n_gpu_layers = 0;
+            params_decode_cpu.split_mode =
+                    LLAMA_SPLIT_MODE_LAYER;
+            params_decode_cpu.fit_params = false;
+            params_decode_cpu.no_host = false;
+            params_decode_cpu.tensor_buft_overrides.clear();
+
+            params_decode_cpu.load_progress_callback =
+                    load_progress_callback;
+            params_decode_cpu.load_progress_callback_user_data =
+                    &load_progress_decode_cpu;
+
+            load_progress_callback(
+                    0.0f,
+                    &load_progress_decode_cpu);
+            load_progress_decode_cpu.t_last_load_progress_ms = 0;
+
+            SRV_INF(
+                    "loading dedicated CPU Generation Decode model "
+                    "from '%s'\n",
+                    params_decode_cpu.model.path.c_str());
+
+            generation_decode_init_cpu =
+                    common_init_from_params(
+                            params_decode_cpu,
+                            true);
+
+            generation_decode_model_cpu =
+                    generation_decode_init_cpu
+                            ? generation_decode_init_cpu->model()
+                            : nullptr;
+
+            if (generation_decode_model_cpu == nullptr) {
+                SRV_ERR(
+                        "failed to load dedicated CPU Generation "
+                        "Decode model, '%s'\n",
+                        params_decode_cpu.model.path.c_str());
+                return false;
+            }
+
+            SRV_INF(
+                    "dedicated CPU Generation Decode model loaded "
+                    "on device %s\n",
+                    ggml_backend_dev_name(cpu_device));
         }
 
         vocab = llama_model_get_vocab(model_tgt);
@@ -4002,10 +4092,15 @@ private:
                         static_cast<uint32_t>(slot.n_ctx);
                 decode_context_params.n_seq_max = 1;
 
+                llama_model * decode_model =
+                        generation_decode_model_cpu != nullptr
+                            ? generation_decode_model_cpu
+                            : model_tgt;
+
                 slot.generation_decode_executor =
                         std::make_unique<
                                 server_generation_decode_executor>(
-                                    model_tgt,
+                                    decode_model,
                                     decode_context_params,
                                     0);
 
