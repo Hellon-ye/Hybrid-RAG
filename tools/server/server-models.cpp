@@ -1917,6 +1917,16 @@ void server_models_routes::init_routes() {
         this->post_rag = [this](const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
 
+        const auto total_start_ms = ggml_time_ms();
+        RagStageMetrics stage_metrics;
+
+        const auto elapsed_ms = [](const auto start_ms) -> std::size_t {
+            const auto end_ms = ggml_time_ms();
+            return end_ms > start_ms
+                    ? static_cast<std::size_t>(end_ms - start_ms)
+                    : 0;
+        };
+
         const json body = json::parse(req.body);
 
         const std::string doc =
@@ -2030,10 +2040,15 @@ void server_models_routes::init_routes() {
 
         // Compute document embeddings through the Router's synchronous
         // internal model interface.
+        const auto document_embedding_start_ms = ggml_time_ms();
+
         const std::vector<std::vector<float>> doc_embeddings =
                 models.request_model_embeddings(
                         embedding_model,
                         source_chunks);
+
+        stage_metrics.document_embedding_ms =
+                elapsed_ms(document_embedding_start_ms);
 
         std::vector<std::string> retrieval_queries = {query};
         std::vector<std::string> sub_queries;
@@ -2042,6 +2057,8 @@ void server_models_routes::init_routes() {
         std::string expansion_model_used;
 
         if (enable_query_expansion) {
+            const auto query_expansion_start_ms = ggml_time_ms();
+
             expansion_model_used = expansion_model.empty()
                     ? generation_model
                     : expansion_model;
@@ -2078,18 +2095,28 @@ void server_models_routes::init_routes() {
             if (!sub_queries.empty()) {
                 retrieval_queries = sub_queries;
             }
+
+            stage_metrics.query_expansion_ms =
+                    elapsed_ms(query_expansion_start_ms);
         }
+
+        const auto query_embedding_start_ms = ggml_time_ms();
 
         const std::vector<std::vector<float>> query_embeddings =
                 models.request_model_embeddings(
                         embedding_model,
                         retrieval_queries);
 
+        stage_metrics.query_embedding_ms =
+                elapsed_ms(query_embedding_start_ms);
+
         if (query_embeddings.size() != retrieval_queries.size()) {
             throw std::runtime_error(
                     "query embedding response count does not match "
                     "retrieval query count");
         }
+
+        const auto vector_search_start_ms = ggml_time_ms();
 
         std::vector<std::size_t> source_indices;
         source_indices.reserve(source_chunks.size());
@@ -2117,6 +2144,9 @@ void server_models_routes::init_routes() {
                         per_query_hits,
                         static_cast<std::size_t>(top_k));
 
+        stage_metrics.vector_search_ms =
+                elapsed_ms(vector_search_start_ms);
+
         std::vector<std::string> retrieved_chunks;
         retrieved_chunks.reserve(retrieved_indices.size());
 
@@ -2143,6 +2173,8 @@ void server_models_routes::init_routes() {
         json rerank_results = json::array();
 
         if (enable_reranking) {
+            const auto reranking_start_ms = ggml_time_ms();
+
             const json ranked_candidates =
                     models.request_model_rerank(
                             rerank_model,
@@ -2175,6 +2207,9 @@ void server_models_routes::init_routes() {
                      ranked_item["relevance_score"]},
                 });
             }
+
+            stage_metrics.reranking_ms =
+                    elapsed_ms(reranking_start_ms);
         }
 
         std::vector<std::string> context_chunks;
@@ -2198,6 +2233,8 @@ void server_models_routes::init_routes() {
         // The current baseline uses a Base model rather than an
         // instruction/chat model. Therefore, use llama.cpp's raw
         // completion endpoint instead of /v1/chat/completions.
+        const auto generation_start_ms = ggml_time_ms();
+
         const std::string prompt =
                 build_generation_prompt(query, context_chunks);
 
@@ -2223,6 +2260,9 @@ void server_models_routes::init_routes() {
         const std::string answer =
                 generation_response["content"].get<std::string>();
 
+        stage_metrics.generation_ms =
+                elapsed_ms(generation_start_ms);
+
         const std::string mode =
                 enable_query_expansion
                         ? (enable_reranking
@@ -2235,9 +2275,22 @@ void server_models_routes::init_routes() {
                                      "retrieval_augmented_sequential"
                                    : "retrieval_augmented_sequential");
 
+        stage_metrics.total_ms = elapsed_ms(total_start_ms);
+
+        const json stage_metrics_json = {
+            {"document_embedding_ms", stage_metrics.document_embedding_ms},
+            {"query_expansion_ms", stage_metrics.query_expansion_ms},
+            {"query_embedding_ms", stage_metrics.query_embedding_ms},
+            {"vector_search_ms", stage_metrics.vector_search_ms},
+            {"reranking_ms", stage_metrics.reranking_ms},
+            {"generation_ms", stage_metrics.generation_ms},
+            {"total_ms", stage_metrics.total_ms},
+        };
+
         json response_data = {
             {"answer", answer},
             {"mode", mode},
+            {"stage_metrics", stage_metrics_json},
             {"generation_model", generation_model},
             {"embedding_model", embedding_model},
             {"enable_reranking", enable_reranking},

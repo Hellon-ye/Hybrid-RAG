@@ -4,6 +4,27 @@
 
 namespace server_schema {
 
+namespace {
+
+std::string parse_generation_backend(
+        const json & data,
+        const char * field_name) {
+    const std::string backend =
+            data.at(field_name).get<std::string>();
+
+    if (backend != "auto" &&
+            backend != "cpu" &&
+            backend != "npu") {
+        throw std::invalid_argument(
+                "Expected one of: auto, cpu, npu; got '" +
+                backend + "'");
+    }
+
+    return backend;
+}
+
+} // namespace
+
 //
 // llama.cpp-specific completion schema
 //
@@ -33,6 +54,34 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
 
     add((new field_bool("return_tokens", params.return_tokens))
         ->set_desc("Return the raw generated token ids in the `tokens` field"));
+
+    add((new field_bool(
+                "generation_handoff",
+                params.generation_handoff))
+        ->set_desc(
+                "Export the formal Generation Prefill/Decode handoff "
+                "containing Prompt sequence state and final Prefill logits"));
+
+    add((new field_str("generation_prefill_backend"))
+        ->set_desc(
+                "Backend used for Generation Prefill: auto, cpu, or npu")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.generation_prefill_backend =
+                    parse_generation_backend(
+                            data,
+                            "generation_prefill_backend");
+        }));
+
+    add((new field_str("generation_decode_backend"))
+        ->set_desc(
+                "Backend used for token-by-token Generation Decode: "
+                "auto, cpu, or npu")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.generation_decode_backend =
+                    parse_generation_backend(
+                            data,
+                            "generation_decode_backend");
+        }));
 
     add((new field_bool("return_progress", params.return_progress))
         ->set_desc("Include prompt processing progress events in stream mode"));
@@ -541,6 +590,52 @@ task_params eval_llama_cmpl_schema(
         // if "reasoning_format" is not provided, its handler will not be called, we will need to handle it here
         auto reasoning_format = params.chat_parser_params.reasoning_format;
         params.chat_parser_params.reasoning_in_content = params.stream && (reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY);
+
+        if (params.generation_handoff) {
+            // AUTO resolves only to a registered backend. The current
+            // permanent reference backend is CPU Prefill -> CPU Decode.
+            if (params.generation_prefill_backend == "auto") {
+                params.generation_prefill_backend = "cpu";
+            }
+
+            if (params.generation_decode_backend == "auto") {
+                params.generation_decode_backend = "cpu";
+            }
+
+            // NPU Prefill uses the normal llama.cpp Context backed by
+            // GGML HTP. Model/backend availability is validated at runtime,
+            // because the request schema has no access to the loaded model.
+            if (params.generation_prefill_backend != "cpu" &&
+                    params.generation_prefill_backend != "npu") {
+                throw std::invalid_argument(
+                        "Field 'generation_prefill_backend': "
+                        "expected CPU or NPU Generation Prefill");
+            }
+
+            if (params.generation_decode_backend == "npu") {
+                throw std::invalid_argument(
+                        "Field 'generation_decode_backend': "
+                        "NPU Generation Decode executor is not registered");
+            }
+
+            if (params.generation_decode_backend != "cpu") {
+                throw std::invalid_argument(
+                        "Generation handoff currently requires "
+                        "CPU Generation Decode");
+            }
+
+            if (params.sampling.backend_sampling) {
+                throw std::invalid_argument(
+                        "Field 'backend_sampling': Generation handoff "
+                        "requires CPU-owned llama.cpp sampling");
+            }
+
+            if (params.sampling.n_probs > 0) {
+                throw std::invalid_argument(
+                        "Field 'n_probs': Generation handoff does not "
+                        "yet expose Decode-side token probabilities");
+            }
+        }
     }
 
     // debugging

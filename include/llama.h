@@ -623,6 +623,14 @@ extern "C" {
     // Returns the total number of parameters in the model
     LLAMA_API uint64_t llama_model_n_params(const struct llama_model * model);
 
+    // Devices associated with the loaded model.
+    LLAMA_API int32_t llama_model_n_devices(
+            const struct llama_model * model);
+
+    LLAMA_API ggml_backend_dev_t llama_model_get_device(
+            const struct llama_model * model,
+            int i);
+
     // Returns true if the model contains an encoder that requires llama_encode() call
     LLAMA_API bool llama_model_has_encoder(const struct llama_model * model);
 

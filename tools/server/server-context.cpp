@@ -1,4 +1,6 @@
 #include "server-context.h"
+#include "server-generation-handoff.h"
+#include "server-generation-executor.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -215,6 +217,15 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // Owns the complete state captured at the Prefill/Decode boundary.
+    // It is request-scoped and is destroyed by reset()/release().
+    std::unique_ptr<server_generation_handoff> generation_handoff;
+
+    // Owns the independent Decode Context and sampler after the formal
+    // Prefill/Decode handoff. The main slot Context remains Prompt-only.
+    std::unique_ptr<server_generation_decode_executor>
+            generation_decode_executor;
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -312,6 +323,9 @@ struct server_slot {
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
+
+        generation_decode_executor.reset();
+        generation_handoff.reset();
 
         // clear speculative decoding stats
         n_draft_total = 0;
@@ -887,6 +901,11 @@ private:
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
 
+    // Optional service-level CPU-only model used by request-level
+    // Generation Decode executors. Executors hold non-owning references.
+    common_init_result_ptr generation_decode_init_cpu;
+    llama_model * generation_decode_model_cpu = nullptr;
+
     llama_context * ctx_tgt = nullptr;
 
     server_batch batch;
@@ -933,12 +952,58 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    static bool model_uses_backend_registry(
+            const llama_model * model,
+            const char * registry_name) {
+        if (model == nullptr || registry_name == nullptr) {
+            return false;
+        }
+
+        const int32_t n_devices =
+                llama_model_n_devices(model);
+
+        for (int32_t i = 0; i < n_devices; ++i) {
+            ggml_backend_dev_t device =
+                    llama_model_get_device(model, i);
+
+            if (device == nullptr) {
+                continue;
+            }
+
+            ggml_backend_reg_t registry =
+                    ggml_backend_dev_backend_reg(device);
+
+            const char * name =
+                    registry != nullptr
+                        ? ggml_backend_reg_name(registry)
+                        : nullptr;
+
+            if (name != nullptr &&
+                    std::string(name) == registry_name) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     void destroy() {
+        // Decode executors contain Contexts that reference the dedicated
+        // CPU Decode model. Destroy every executor before releasing that
+        // model.
+        for (auto & slot : slots) {
+            slot.generation_decode_executor.reset();
+            slot.generation_handoff.reset();
+        }
+
         spec.reset();
         spec_init.reset();
 
         ctx_dft   = nullptr;
         model_dft = nullptr;
+
+        generation_decode_model_cpu = nullptr;
+        generation_decode_init_cpu.reset();
 
         llama_init.reset();
 
@@ -998,9 +1063,12 @@ private:
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
-        load_progress_data load_progress_text  (this, "text_model");
-        load_progress_data load_progress_mmproj(this, "mmproj_model");
-        load_progress_data load_progress_spec  (this, "spec_model");
+        load_progress_data load_progress_text      (this, "text_model");
+        load_progress_data load_progress_mmproj    (this, "mmproj_model");
+        load_progress_data load_progress_spec      (this, "spec_model");
+        load_progress_data load_progress_decode_cpu(
+                this,
+                "generation_decode_cpu_model");
 
         const bool is_resume = sleeping;
 
@@ -1008,6 +1076,8 @@ private:
         params_base.n_outputs_max = server_n_outputs_max(params_base);
 
         const bool has_mmproj = !params.mmproj.path.empty();
+        const bool has_generation_decode_cpu =
+                params.generation_decode_cpu;
         const bool has_draft = params.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
@@ -1016,15 +1086,19 @@ private:
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
+            if (has_generation_decode_cpu) {
+                stages.push_back("generation_decode_cpu_model");
+            }
             if (has_spec) {
                 stages.push_back("spec_model");
             }
             if (has_mmproj) {
                 stages.push_back("mmproj_model");
             }
-            load_progress_text.stages   = stages;
-            load_progress_mmproj.stages = stages;
-            load_progress_spec.stages   = stages;
+            load_progress_text.stages      = stages;
+            load_progress_decode_cpu.stages = stages;
+            load_progress_mmproj.stages    = stages;
+            load_progress_spec.stages      = stages;
 
             // trigger 0% progress
             load_progress_callback(0.0f, &load_progress_text);
@@ -1150,6 +1224,71 @@ private:
         if (model_tgt == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
             return false;
+        }
+
+        if (params_base.generation_decode_cpu) {
+            ggml_backend_dev_t cpu_device =
+                    ggml_backend_dev_by_type(
+                            GGML_BACKEND_DEVICE_TYPE_CPU);
+
+            if (cpu_device == nullptr) {
+                SRV_ERR(
+                        "%s",
+                        "failed to locate CPU backend device for "
+                        "Generation Decode\n");
+                return false;
+            }
+
+            common_params params_decode_cpu = params_base;
+
+            // An explicit, null-terminated CPU device list prevents the
+            // model loader from auto-selecting Hexagon or another
+            // accelerator. n_gpu_layers=0 keeps every model tensor on CPU.
+            params_decode_cpu.devices = {cpu_device, nullptr};
+            params_decode_cpu.n_gpu_layers = 0;
+            params_decode_cpu.split_mode =
+                    LLAMA_SPLIT_MODE_LAYER;
+            params_decode_cpu.fit_params = false;
+            params_decode_cpu.no_host = false;
+            params_decode_cpu.tensor_buft_overrides.clear();
+
+            params_decode_cpu.load_progress_callback =
+                    load_progress_callback;
+            params_decode_cpu.load_progress_callback_user_data =
+                    &load_progress_decode_cpu;
+
+            load_progress_callback(
+                    0.0f,
+                    &load_progress_decode_cpu);
+            load_progress_decode_cpu.t_last_load_progress_ms = 0;
+
+            SRV_INF(
+                    "loading dedicated CPU Generation Decode model "
+                    "from '%s'\n",
+                    params_decode_cpu.model.path.c_str());
+
+            generation_decode_init_cpu =
+                    common_init_from_params(
+                            params_decode_cpu,
+                            true);
+
+            generation_decode_model_cpu =
+                    generation_decode_init_cpu
+                            ? generation_decode_init_cpu->model()
+                            : nullptr;
+
+            if (generation_decode_model_cpu == nullptr) {
+                SRV_ERR(
+                        "failed to load dedicated CPU Generation "
+                        "Decode model, '%s'\n",
+                        params_decode_cpu.model.path.c_str());
+                return false;
+            }
+
+            SRV_INF(
+                    "dedicated CPU Generation Decode model loaded "
+                    "on device %s\n",
+                    ggml_backend_dev_name(cpu_device));
         }
 
         vocab = llama_model_get_vocab(model_tgt);
@@ -1850,14 +1989,40 @@ private:
             slot.has_next_token = true;
         }
 
-        // if context shifting is disabled, make sure that we don't run out of context
-        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+        // The independent Decode executor currently has no context-shift
+        // implementation. Its next_position() is the position of the
+        // pending generated token and therefore represents the logical
+        // number of tokens already present in its Decode Context.
+        const bool generation_decode_active =
+                slot.generation_decode_executor &&
+                slot.generation_decode_executor->active();
+
+        const int32_t logical_context_tokens =
+                generation_decode_active
+                    ? static_cast<int32_t>(
+                            slot.generation_decode_executor
+                                    ->next_position())
+                    : slot.prompt.n_tokens();
+
+        const bool context_shift_available =
+                params_base.ctx_shift &&
+                !generation_decode_active;
+
+        if (!context_shift_available &&
+                logical_context_tokens + 1 >= slot.n_ctx) {
             slot.truncated      = true;
             slot.stop           = STOP_TYPE_LIMIT;
             slot.has_next_token = false;
 
-            SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_decoded = %d, n_ctx = %d\n",
-                    slot.prompt.n_tokens(), slot.task->n_tokens(), slot.n_decoded, slot.n_ctx);
+            SLT_DBG(
+                    slot,
+                    "stopped due to running out of context capacity, "
+                    "logical_n_tokens = %d, task.n_tokens = %d, "
+                    "n_decoded = %d, n_ctx = %d\n",
+                    logical_context_tokens,
+                    slot.task->n_tokens(),
+                    slot.n_decoded,
+                    slot.n_ctx);
         }
 
         // check the limits
@@ -1984,6 +2149,80 @@ private:
                 });
             }
         }
+    }
+
+    // Convert one already sampled-and-accepted token into the normal
+    // server response/state lifecycle. This keeps streaming, stopping,
+    // metrics and final-response behavior shared by all Decode backends.
+    bool process_generation_token(
+            server_slot & slot,
+            llama_token token,
+            int32_t logits_index,
+            bool main_context_logits_available) {
+        slot.i_batch = -1;
+
+        const int64_t t_now = ggml_time_us();
+
+        slot.n_decoded += 1;
+
+        if (slot.n_decoded == 1) {
+            slot.t_start_generation = t_now;
+            slot.t_print_last = t_now;
+            slot.n_decoded_last = 0;
+            slot.t_prompt_processing =
+                    (slot.t_start_generation -
+                     slot.t_start_process_prompt) /
+                    1e3;
+
+            metrics.on_prompt_eval(slot);
+        }
+
+        slot.t_token_generation =
+                std::max<int64_t>(
+                        1,
+                        t_now - slot.t_start_generation) /
+                1e3;
+
+        completion_token_output result;
+        result.tok = token;
+        result.text_to_send =
+                common_token_to_piece(
+                        slot.ctx_tgt,
+                        result.tok,
+                        params_base.special ||
+                            slot.task->params.sampling
+                                    .preserved_tokens
+                                    .find(result.tok) !=
+                            slot.task->params.sampling
+                                    .preserved_tokens
+                                    .end());
+        result.prob = 1.0f;
+
+        if (slot.task->params.sampling.n_probs > 0) {
+            if (!main_context_logits_available) {
+                throw std::runtime_error(
+                        "Generation Decode executor does not yet "
+                        "expose token probabilities");
+            }
+
+            populate_token_probs(
+                    slot,
+                    result,
+                    slot.task->params.post_sampling_probs,
+                    params_base.special,
+                    logits_index);
+        }
+
+        if (!process_token(result, slot)) {
+            slot.print_timings();
+            send_final_response(slot);
+            metrics.on_prediction(slot);
+            slot.release();
+            return false;
+        }
+
+        slot.print_timings_tg();
+        return true;
     }
 
     void send_error(const server_task & task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
@@ -2836,6 +3075,13 @@ private:
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
+            if (slot.generation_decode_executor &&
+                    slot.generation_decode_executor->active()) {
+                // Independent Decode Contexts currently stop at capacity
+                // rather than shifting the main Prompt-only Context.
+                return;
+            }
+
             if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
@@ -2905,6 +3151,28 @@ private:
         // start populating the batch for this iteration
         batch.clear();
 
+        // Advance each independent Decode worker by exactly one token.
+        //
+        // decode_next() evaluates the previously sampled pending token in
+        // the independent Context and returns the next sampled-and-accepted
+        // token. No generated token is inserted into the main Context.
+        iterate(slots, [&](server_slot & slot) {
+            if (slot.state != SLOT_STATE_GENERATING ||
+                    !slot.generation_decode_executor ||
+                    !slot.generation_decode_executor->active()) {
+                return;
+            }
+
+            const llama_token token =
+                    slot.generation_decode_executor->decode_next();
+
+            process_generation_token(
+                    slot,
+                    token,
+                    -1,
+                    false);
+        });
+
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
 
@@ -2914,6 +3182,12 @@ private:
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
+                return;
+            }
+
+            if (slot.generation_decode_executor &&
+                    slot.generation_decode_executor->active()) {
+                // This slot is advanced above by its independent worker.
                 return;
             }
 
@@ -3678,6 +3952,17 @@ private:
             return idx >= off && idx < off + n_batch_tokens;
         };
 
+        auto accept_special_token =
+                [&](server_slot & slot, llama_token token) {
+                    return params_base.special ||
+                        slot.task->params.sampling
+                                .preserved_tokens
+                                .find(token) !=
+                        slot.task->params.sampling
+                                .preserved_tokens
+                                .end();
+                };
+
         // TODO @ngxson : it's tricky to make sub-batch compatible with common_sampler_sample_and_accept_n,
         // so for now we will throw an error in this case: https://github.com/ggml-org/llama.cpp/issues/24840
         iterate(slots, [&](server_slot & slot) {
@@ -3687,11 +3972,6 @@ private:
                 }
             }
         });
-
-        auto accept_special_token = [&](server_slot & slot, llama_token token) {
-            return params_base.special ||
-                slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
-        };
 
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
@@ -3741,51 +4021,207 @@ private:
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
 
+            // Export the formal Prefill/Decode handoff before the first sampling operation.
+            //
+            // Sequence memory contains Prompt state only, final-position
+            // logits are available, and the sampler RNG has not produced
+            // any generated token.
+            if (slot.n_decoded == 0 &&
+                    slot.task->params.generation_handoff) {
+                if (slot.can_speculate()) {
+                    throw std::runtime_error(
+                            "generation handoff is not compatible with "
+                            "speculative decoding");
+                }
+
+                if (slot.prompt.tokens.has_mtmd) {
+                    throw std::runtime_error(
+                            "generation handoff does not currently support "
+                            "multimodal sequence state");
+                }
+
+                const llama_model * model =
+                        llama_get_model(slot.ctx_tgt);
+                const llama_vocab * vocab =
+                        llama_model_get_vocab(model);
+
+                if (vocab == nullptr) {
+                    throw std::runtime_error(
+                            "generation context has no vocabulary");
+                }
+
+                const std::string & prefill_backend =
+                        slot.task->params
+                                .generation_prefill_backend;
+
+                const bool producer_uses_htp =
+                        model_uses_backend_registry(
+                                model,
+                                "HTP");
+
+                if (prefill_backend == "npu") {
+                    if (!producer_uses_htp) {
+                        throw std::runtime_error(
+                                "generation_prefill_backend=npu "
+                                "requires the Producer model to be "
+                                "loaded with an HTP backend device");
+                    }
+
+                    if (generation_decode_model_cpu == nullptr) {
+                        throw std::runtime_error(
+                                "NPU Prefill -> CPU Decode requires "
+                                "--generation-decode-cpu");
+                    }
+                } else if (prefill_backend == "cpu") {
+                    if (producer_uses_htp) {
+                        throw std::runtime_error(
+                                "generation_prefill_backend=cpu "
+                                "does not match an HTP-backed "
+                                "Producer model");
+                    }
+                } else {
+                    throw std::runtime_error(
+                            "unsupported Generation Prefill backend");
+                }
+
+                const int32_t n_vocab =
+                        llama_vocab_n_tokens(vocab);
+
+                const float * final_logits =
+                        llama_get_logits_ith(
+                                slot.ctx_tgt,
+                                tok_idx);
+
+                if (final_logits == nullptr) {
+                    throw std::runtime_error(
+                            "failed to obtain final Prefill logits");
+                }
+
+                slot.generation_handoff =
+                        std::make_unique<
+                                server_generation_handoff>(
+                                server_generation_handoff_export(
+                                        slot.ctx_tgt,
+                                        slot.id,
+                                        static_cast<std::uint64_t>(
+                                                slot.task->id),
+                                        server_generation_model_identity(
+                                                slot.ctx_tgt),
+                                        server_generation_runtime_identity(
+                                                slot.ctx_tgt),
+                                        slot.task->params
+                                                .generation_prefill_backend,
+                                        slot.prompt.tokens
+                                                .get_text_tokens(),
+                                        final_logits,
+                                        static_cast<std::size_t>(
+                                                n_vocab),
+                                        slot.prompt.tokens.pos_next(),
+                                        slot.task->params.sampling));
+
+                SLT_INF(
+                        slot,
+                        "generation handoff exported before sampling: "
+                        "request_id=%" PRIu64 ", "
+                        "source_seq_id=%d, "
+                        "prompt_tokens=%zu, "
+                        "next_position=%d, "
+                        "state_bytes=%zu, "
+                        "logits_count=%zu, "
+                        "producer_backend=%s\n",
+                        slot.generation_handoff->request_id,
+                        slot.generation_handoff->source_seq_id,
+                        slot.generation_handoff
+                                ->prompt_tokens.size(),
+                        slot.generation_handoff->next_position,
+                        slot.generation_handoff
+                                ->sequence_state.size(),
+                        slot.generation_handoff
+                                ->final_logits.size(),
+                        slot.generation_handoff
+                                ->producer_backend.c_str());
+
+                if (!slot.lora.empty()) {
+                    throw std::runtime_error(
+                            "Generation handoff does not currently "
+                            "support LoRA or aLoRA adapters");
+                }
+
+                if (slot.task->params.generation_decode_backend !=
+                        "cpu") {
+                    throw std::runtime_error(
+                            "only the CPU Generation Decode executor "
+                            "is currently registered");
+                }
+
+                auto decode_context_params =
+                        common_context_params_to_llama(params_base);
+
+                decode_context_params.n_ctx =
+                        static_cast<uint32_t>(slot.n_ctx);
+                decode_context_params.n_seq_max = 1;
+
+                llama_model * decode_model = nullptr;
+
+                if (prefill_backend == "npu") {
+                    // The dedicated CPU Model is mandatory for the formal
+                    // NPU Prefill -> CPU Decode route. Never fall back to
+                    // the HTP-backed Producer Model.
+                    decode_model = generation_decode_model_cpu;
+                } else {
+                    // CPU Prefill -> CPU Decode remains the permanent
+                    // reference validation path.
+                    decode_model =
+                            generation_decode_model_cpu != nullptr
+                                ? generation_decode_model_cpu
+                                : model_tgt;
+                }
+
+                if (decode_model == nullptr) {
+                    throw std::runtime_error(
+                            "Generation Decode model is unavailable");
+                }
+
+                slot.generation_decode_executor =
+                        std::make_unique<
+                                server_generation_decode_executor>(
+                                    decode_model,
+                                    decode_context_params,
+                                    0);
+
+                const llama_token first_token =
+                        slot.generation_decode_executor->begin(
+                                *slot.generation_handoff);
+
+                // begin() synchronously restores the sequence state and
+                // initializes the Decode-side sampler. Release the transport
+                // payload after synchronous consumption instead of retaining
+                // its KV-state and logits buffers for the full request.
+                slot.generation_handoff.reset();
+
+                process_generation_token(
+                        slot,
+                        first_token,
+                        -1,
+                        false);
+
+                // Do not sample from or append to the main Context.
+                return;
+            }
+
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
 
-            slot.i_batch = -1;
-
             common_sampler_accept(slot.smpl.get(), id, true);
 
-            // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
-            const int64_t t_now = ggml_time_us();
-
-            slot.n_decoded += 1;
-
-            if (slot.n_decoded == 1) {
-                slot.t_start_generation = t_now;
-                slot.t_print_last = t_now;
-                slot.n_decoded_last = 0;
-                slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
-                metrics.on_prompt_eval(slot);
-            }
-
-            slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;
-
-            completion_token_output result;
-            result.tok          = id;
-            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-            result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
-
-            if (slot.task->params.sampling.n_probs > 0) {
-                populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
-            }
-
-            if (!process_token(result, slot)) {
-                // release slot because of stop condition
-                slot.print_timings();
-                send_final_response(slot);
-                metrics.on_prediction(slot);
-                slot.release();
-
-                return;
-            }
-
-            slot.print_timings_tg();
+            process_generation_token(
+                    slot,
+                    id,
+                    tok_idx,
+                    true);
         });
 
         // speculative decoding - main model sample and accept

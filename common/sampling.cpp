@@ -1,5 +1,6 @@
 #include "sampling.h"
 
+#include <stdexcept>
 #include "common.h"
 #include "fit.h"
 #include "log.h"
@@ -160,6 +161,38 @@ struct common_sampler {
 
         cur_p = { cur.data(), cur.size(), -1, false };
     }
+
+    void set_logits(const float * logits, int32_t n_vocab) {
+        if (logits == nullptr) {
+            throw std::invalid_argument(
+                    "cannot sample from a null logits buffer");
+        }
+
+        if (n_vocab <= 0) {
+            throw std::invalid_argument(
+                    "cannot sample from an empty logits buffer");
+        }
+
+        cur.resize(static_cast<size_t>(n_vocab));
+
+        for (llama_token token_id = 0;
+                token_id < n_vocab;
+                ++token_id) {
+            cur[static_cast<size_t>(token_id)] = llama_token_data {
+                token_id,
+                logits[token_id],
+                0.0f,
+            };
+        }
+
+        cur_p = {
+            cur.data(),
+            cur.size(),
+            -1,
+            false,
+        };
+    }
+
 
     common_time_meas tm() {
         return common_time_meas(t_total_us, params.no_perf);
@@ -620,6 +653,89 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     return id;
 }
+
+llama_token common_sampler_sample_from_logits(
+        struct common_sampler * gsmpl,
+        const float * logits,
+        int32_t n_vocab,
+        bool grammar_first) {
+    if (gsmpl == nullptr) {
+        throw std::invalid_argument(
+                "cannot sample with a null common sampler");
+    }
+
+    // The external logits buffer is already host-visible. Unlike
+    // common_sampler_sample(), this path has no llama_context to
+    // synchronize and no backend-sampled token to consume.
+    const auto tm = gsmpl->tm();
+
+    auto & grmr    = gsmpl->grmr;
+    auto & rbudget = gsmpl->rbudget;
+    auto & chain   = gsmpl->chain;
+    auto & cur_p   = gsmpl->cur_p;
+
+    gsmpl->set_logits(logits, n_vocab);
+
+    // Keep the CPU sampling semantics identical to the ordinary path.
+    llama_sampler_apply(rbudget, &cur_p);
+
+    if (grammar_first && grammar_should_apply(gsmpl)) {
+        llama_sampler_apply(grmr, &cur_p);
+    }
+
+    llama_sampler_apply(chain, &cur_p);
+
+    GGML_ASSERT(
+            cur_p.selected != -1 &&
+            "no selected token during raw-logits sampling");
+
+    llama_token id = cur_p.data[cur_p.selected].id;
+
+    if (grammar_first || !grammar_should_apply(gsmpl)) {
+        return id;
+    }
+
+    // Grammar rejection sampling.
+    llama_token_data single_token_data = {
+        id,
+        1.0f,
+        0.0f,
+    };
+    llama_token_data_array single_token_data_array = {
+        &single_token_data,
+        1,
+        -1,
+        false,
+    };
+
+    llama_sampler_apply(grmr, &single_token_data_array);
+
+    const bool is_valid =
+            single_token_data_array.data[0].logit != -INFINITY;
+
+    if (is_valid) {
+        return id;
+    }
+
+    // The first sampler pass mutates cur_p. Reload the original external
+    // logits before applying grammar-first resampling.
+    gsmpl->set_logits(logits, n_vocab);
+
+    llama_sampler_apply(rbudget, &cur_p);
+
+    if (grammar_should_apply(gsmpl)) {
+        llama_sampler_apply(grmr, &cur_p);
+    }
+
+    llama_sampler_apply(chain, &cur_p);
+
+    GGML_ASSERT(
+            cur_p.selected != -1 &&
+            "no selected token during grammar resampling");
+
+    return cur_p.data[cur_p.selected].id;
+}
+
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");

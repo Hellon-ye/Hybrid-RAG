@@ -15,6 +15,10 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    server-generation-handoff.cpp
+    server-generation-handoff.h
+    server-generation-executor.cpp
+    server-generation-executor.h
     server-stream.cpp
     server-stream.h
     server-tools.cpp

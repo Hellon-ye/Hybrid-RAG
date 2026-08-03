@@ -3263,6 +3263,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_REUSE"));
     add_opt(common_arg(
+        {"--generation-decode-cpu"},
+        {"--no-generation-decode-cpu"},
+        string_format(
+            "load a dedicated CPU-only model instance for Generation "
+            "handoff Decode (default: %s)",
+            params.generation_decode_cpu ? "enabled" : "disabled"
+        ),
+        [](common_params & params, bool value) {
+            params.generation_decode_cpu = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER})
+     .set_env("LLAMA_ARG_GENERATION_DECODE_CPU"));
+    add_opt(common_arg(
         {"--metrics"},
         string_format("enable prometheus compatible metrics endpoint (default: %s)", params.endpoint_metrics ? "enabled" : "disabled"),
         [](common_params & params) {

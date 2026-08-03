@@ -257,6 +257,24 @@ set_tests_properties(test-recurrent-state-rollback PROPERTIES FIXTURES_REQUIRED 
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+llama_build_and_test(
+    test-generation-handoff.cpp
+    LABEL "model"
+    ARGS -m "${MODEL_DEST}"
+)
+target_include_directories(
+    test-generation-handoff
+    PRIVATE ${PROJECT_SOURCE_DIR}/tools/server
+)
+target_link_libraries(
+    test-generation-handoff
+    PRIVATE server-context
+)
+set_tests_properties(
+    test-generation-handoff
+    PROPERTIES FIXTURES_REQUIRED test-download-model
+)
+
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)

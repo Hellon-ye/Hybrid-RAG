@@ -666,6 +666,9 @@ struct common_params {
     bool endpoint_props   = false; // only control POST requests, not GET
     bool endpoint_metrics = false;
 
+    // Load a dedicated CPU-only model instance for Generation Decode.
+    bool generation_decode_cpu = false;
+
     // enable built-in tools
     std::vector<std::string> server_tools;
 
