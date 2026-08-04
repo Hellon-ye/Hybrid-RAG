@@ -3,7 +3,7 @@
 #include "rag-scheduler.h"
 #include "server-rag.h"
 
-class server_models;
+struct server_models;
 
 class RagServerExecutor : public RagTaskExecutor {
 public:
