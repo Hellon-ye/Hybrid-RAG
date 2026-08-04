@@ -16,10 +16,13 @@ enum class RagTaskType {
     QueryExpansion,
     QueryEmbedding,
     VectorSearch,
+    RetrievalMerge,
     Reranking,
+    Generation,
     GenerationPrefill,
     GenerationDecode,
     CandidateMerge,
+    Finalize,
 };
 
 // Compute backend selection
@@ -78,6 +81,7 @@ struct RagTaskMetrics {
 // Non-copyable because of internal mutex/cv.
 struct RagExecutionPlan {
     int                           request_id;
+    void *                        runtime;
     std::vector<RagTaskNode>      nodes;
     std::map<int, RagTaskMetrics> metrics;
 
@@ -120,6 +124,7 @@ struct RagTaskContext {
     int         request_id;
     RagTaskType type;
     RagBackend  backend;
+    void *      runtime;
 };
 
 // Result returned by an executor after running a task

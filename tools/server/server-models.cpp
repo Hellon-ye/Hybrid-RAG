@@ -4,6 +4,8 @@
 #include "server-context.h"
 #include "server-stream.h"
 #include "server-rag.h"
+#include "server-rag-executors.h"
+#include "rag-scheduler.h"
 
 #include "build-info.h"
 #include "preset.h"
@@ -1928,6 +1930,70 @@ void server_models_routes::init_routes() {
         };
 
         const json body = json::parse(req.body);
+
+        const std::string requested_mode = json_value(body, "mode", std::string("sequential"));
+        if (requested_mode == "hetero_parallel") {
+            auto runtime = std::make_shared<RagRequestRuntime>();
+            runtime->request.doc = json_value(body, "doc", std::string());
+            runtime->request.query = json_value(body, "query", std::string());
+            runtime->request.generation_model = json_value(body, "generation_model", std::string());
+            runtime->request.embedding_model = json_value(body, "embedding_model", std::string());
+            runtime->request.rerank_model = json_value(body, "rerank_model", std::string());
+            runtime->request.expansion_model = json_value(body, "expansion_model", std::string());
+            runtime->request.enable_query_expansion = json_value(body, "enable_query_expansion", false);
+            runtime->request.top_k = json_value(body, "top_k", std::size_t(20));
+            runtime->request.top_n = json_value(body, "top_n", std::size_t(5));
+            runtime->request.max_tokens = json_value(body, "max_tokens", std::size_t(64));
+            runtime->request.temperature = json_value(body, "temperature", 0.1F);
+            runtime->request.generation_prefill_backend =
+                    json_value(
+                            body,
+                            "generation_prefill_backend",
+                            std::string("npu"));
+            runtime->request.generation_decode_backend =
+                    json_value(
+                            body,
+                            "generation_decode_backend",
+                            std::string("cpu"));
+            if (runtime->request.doc.empty() || runtime->request.query.empty() || runtime->request.generation_model.empty() || runtime->request.embedding_model.empty()) {
+                res_err(res, format_error_response("doc, query, generation_model and embedding_model are required", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            RagExecutionPlan plan;
+            plan.request_id = static_cast<int>(ggml_time_us() & 0x7fffffff);
+            plan.runtime = runtime.get();
+            const RagTaskType types[] = {
+                RagTaskType::DocumentEmbedding,
+                RagTaskType::QueryExpansion,
+                RagTaskType::QueryEmbedding,
+                RagTaskType::VectorSearch,
+                RagTaskType::RetrievalMerge,
+                RagTaskType::Reranking,
+                RagTaskType::Generation,
+                RagTaskType::Finalize,
+            };
+            std::vector<std::unique_ptr<RagServerExecutor>> executors;
+            RagScheduler scheduler;
+            for (int i = 0; i < static_cast<int>(sizeof(types) / sizeof(types[0])); ++i) {
+                // The Router executor itself runs on the Host.
+                // The Generation child performs the real NPU Prefill
+                // followed by CPU Decode internally.
+                const RagBackend backend = RagBackend::CPU;
+                plan.add_node(i, types[i], backend);
+                if (i > 0) plan.add_dependency(i - 1, i);
+                executors.emplace_back(new RagServerExecutor(&models, types[i]));
+                scheduler.register_executor(types[i], backend, executors.back().get());
+            }
+            if (!scheduler.run(plan)) {
+                std::string error = runtime->error.empty() ? "heterogeneous RAG execution failed" : runtime->error;
+                res_err(res, format_error_response(error, ERROR_TYPE_SERVER));
+                return res;
+            }
+            json node_metrics = json::array();
+            for (const auto & metric : plan.metrics) node_metrics.push_back({{"node_id", metric.first}, {"queue_wait_ms", metric.second.queue_wait_ms}, {"execution_ms", metric.second.execution_ms}, {"backend", metric.second.selected_backend == RagBackend::NPU ? "npu" : "cpu"}});
+            res_ok(res, {{"answer", runtime->final_answer}, {"context_chunks", runtime->reranked_chunks}, {"mode_requested", requested_mode}, {"mode_used", "hetero_parallel"}, {"scheduler_metrics", node_metrics}, {"stage_metrics", {{"total_ms", static_cast<std::size_t>(ggml_time_ms() - total_start_ms)}}}});
+            return res;
+        }
 
         const std::string doc =
                 json_value(body, "doc", std::string());

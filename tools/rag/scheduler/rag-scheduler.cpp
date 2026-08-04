@@ -13,7 +13,7 @@ static int64_t now_ms()
 
 // ---- RagExecutionPlan ----
 
-RagExecutionPlan::RagExecutionPlan() : request_id(0), cancel_requested(false)
+RagExecutionPlan::RagExecutionPlan() : request_id(0), runtime(nullptr), cancel_requested(false)
 {}
 
 RagTaskNode * RagExecutionPlan::find_node(int id)
@@ -415,6 +415,7 @@ bool RagScheduler::run(RagExecutionPlan & plan)
                     ctx.request_id = plan.request_id;
                     ctx.type       = task_type;
                     ctx.backend    = backend;
+                    ctx.runtime    = plan.runtime;
                     result = exec->execute(ctx);
                 } else {
                     result.success       = false;

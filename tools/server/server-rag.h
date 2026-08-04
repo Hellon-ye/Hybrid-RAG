@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <string>
 #include <vector>
+#include <mutex>
+#include <memory>
 
 struct RagRequest {
     std::string doc;
@@ -39,6 +41,23 @@ struct RagStageMetrics {
     std::size_t total_ms = 0;
 };
 
+struct RagRequestRuntime {
+    RagRequest request;
+    std::vector<std::string> chunks;
+    std::vector<std::vector<float>> document_embeddings;
+    std::vector<std::string> expanded_queries;
+    std::vector<std::vector<float>> query_embeddings;
+    std::vector<std::vector<std::size_t>> retrieval_results;
+    std::vector<std::size_t> retrieved_indices;
+    std::vector<std::string> reranked_chunks;
+    std::string generation_prompt;
+    std::string generation_result;
+    std::string final_answer;
+    RagStageMetrics stage_metrics;
+    std::string error;
+    std::mutex mutex;
+};
+
 std::string rag_trim(std::string value);
 
 std::vector<std::string> rag_split_sub_queries(
@@ -70,4 +89,3 @@ std::vector<std::string> build_generation_segments(
         const std::string & query,
         const std::vector<std::string> & sub_queries,
         const std::vector<std::string> & context_chunks);
-
