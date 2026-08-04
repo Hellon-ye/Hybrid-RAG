@@ -1,7 +1,11 @@
 #include "rag-scheduler.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
+#include <deque>
+#include <exception>
+#include <limits>
 
 // ---- internal helpers ----
 
@@ -232,6 +236,21 @@ RagTaskResult MockNPUWorker::execute(const RagTaskContext & ctx)
 
 // ---- RagScheduler ----
 
+RagScheduler::RagScheduler()
+    : cpu_worker_count_(4)
+    , npu_worker_count_(1)
+{}
+
+void RagScheduler::set_worker_counts(
+        std::size_t cpu_workers,
+        std::size_t npu_workers) {
+    cpu_worker_count_ = std::max<std::size_t>(
+            1,
+            cpu_workers);
+
+    npu_worker_count_ = npu_workers;
+}
+
 void RagScheduler::register_executor(RagTaskType type, RagBackend backend, RagTaskExecutor * executor)
 {
     ExecutorKey key;
@@ -331,198 +350,610 @@ bool RagScheduler::run(RagExecutionPlan & plan)
 
     plan.cancel_requested.store(false);
     plan.init_deps();
+    plan.metrics.clear();
 
-    // Per-run local state (protected by plan.mtx)
-    std::queue<int>       ready_q;
+    const bool serial_policy =
+            plan.policy == RagSchedulePolicy::Sequential ||
+            plan.policy == RagSchedulePolicy::CarrierBaseline;
+
+    const bool allow_stealing =
+            plan.policy == RagSchedulePolicy::HeteroParallel ||
+            plan.policy == RagSchedulePolicy::NpuCpuCriticalScore;
+
+    const bool critical_score_policy =
+            plan.policy == RagSchedulePolicy::NpuCpuCriticalScore;
+
+    const std::size_t cpu_workers =
+            serial_policy
+                    ? 1
+                    : std::max<std::size_t>(
+                              1,
+                              cpu_worker_count_);
+
+    const std::size_t npu_workers =
+            serial_policy
+                    ? std::min<std::size_t>(
+                              1,
+                              npu_worker_count_)
+                    : npu_worker_count_;
+
+    std::deque<int> cpu_ready;
+    std::deque<int> npu_ready;
     std::map<int, int64_t> enqueue_time;
-    int                   active = 0;
 
-    // Seed the ready queue with nodes that have no predecessors
+    int active = 0;
+
+    const auto & queue_for =
+            [&](RagBackend backend) -> std::deque<int> & {
+        return backend == RagBackend::NPU
+                ? npu_ready
+                : cpu_ready;
+    };
+
+    const auto other_backend =
+            [](RagBackend backend) {
+        return backend == RagBackend::NPU
+                ? RagBackend::CPU
+                : RagBackend::NPU;
+    };
+
+    const auto worker_available =
+            [&](RagBackend backend) {
+        if (backend == RagBackend::CPU) {
+            return cpu_workers > 0;
+        }
+
+        if (backend == RagBackend::NPU) {
+            return npu_workers > 0;
+        }
+
+        return false;
+    };
+
+    const auto backend_allowed =
+            [](const RagTaskNode & node,
+               RagBackend backend) {
+        if (backend != RagBackend::CPU &&
+            backend != RagBackend::NPU) {
+            return false;
+        }
+
+        if (!node.allowed_backends.empty()) {
+            return std::find(
+                           node.allowed_backends.begin(),
+                           node.allowed_backends.end(),
+                           backend) !=
+                    node.allowed_backends.end();
+        }
+
+        if (node.target_backend == RagBackend::Auto) {
+            return true;
+        }
+
+        return node.target_backend == backend;
+    };
+
+    const auto can_run =
+            [&](const RagTaskNode & node,
+                RagBackend backend) {
+        return worker_available(backend) &&
+               backend_allowed(node, backend) &&
+               find_executor(node.type, backend) != nullptr;
+    };
+
+    const auto preferred_backend =
+            [&](const RagTaskNode & node) {
+        return resolve_backend(
+                node.type,
+                node.target_backend);
+    };
+
+    const auto mark_unrunnable_locked =
+            [&](RagTaskNode & node) {
+        node.state = RagTaskState::Failed;
+
+        auto & metric = plan.metrics[node.id];
+
+        metric.task_type = node.type;
+        metric.preferred_backend =
+                preferred_backend(node);
+        metric.query_index = node.query_index;
+        metric.candidate_index =
+                node.candidate_index;
+        metric.final_state =
+                RagTaskState::Failed;
+        metric.error_message =
+                "no allowed worker/executor for task";
+
+        propagate_failure(plan, node.id);
+    };
+
+    const auto enqueue_ready_locked =
+            [&](int task_id) {
+        RagTaskNode * node =
+                plan.find_node(task_id);
+
+        if (!node ||
+            node->state == RagTaskState::Running ||
+            node->state == RagTaskState::Completed ||
+            node->state == RagTaskState::Failed ||
+            node->state == RagTaskState::Cancelled) {
+            return;
+        }
+
+        const RagBackend preferred =
+                preferred_backend(*node);
+
+        RagBackend queue_backend = preferred;
+
+        if (!can_run(*node, queue_backend)) {
+            const RagBackend alternate =
+                    other_backend(queue_backend);
+
+            if (!can_run(*node, alternate)) {
+                mark_unrunnable_locked(*node);
+                return;
+            }
+
+            queue_backend = alternate;
+        }
+
+        node->state = RagTaskState::Ready;
+
+        auto & metric = plan.metrics[task_id];
+
+        metric.task_type = node->type;
+        metric.preferred_backend = preferred;
+        metric.query_index = node->query_index;
+        metric.candidate_index =
+                node->candidate_index;
+        metric.final_state =
+                RagTaskState::Ready;
+
+        enqueue_time[task_id] = now_ms();
+        queue_for(queue_backend).push_back(task_id);
+    };
+
+    const auto eligible =
+            [&](int task_id,
+                RagBackend worker_backend,
+                bool stealing) {
+        const RagTaskNode * node =
+                plan.find_node(task_id);
+
+        if (!node ||
+            node->state != RagTaskState::Ready) {
+            return false;
+        }
+
+        if (stealing && !node->stealable) {
+            return false;
+        }
+
+        return can_run(*node, worker_backend);
+    };
+
+    const auto has_eligible =
+            [&](const std::deque<int> & queue,
+                RagBackend worker_backend,
+                bool stealing) {
+        for (const int task_id : queue) {
+            if (eligible(
+                        task_id,
+                        worker_backend,
+                        stealing)) {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    const auto pop_queue_locked =
+            [&](std::deque<int> & queue,
+                RagBackend worker_backend,
+                bool stealing) {
+        std::size_t selected =
+                std::numeric_limits<std::size_t>::max();
+
+        double selected_score =
+                std::numeric_limits<double>::lowest();
+
+        for (std::size_t index = 0;
+             index < queue.size();) {
+            const int task_id = queue[index];
+            const RagTaskNode * node =
+                    plan.find_node(task_id);
+
+            if (!node ||
+                node->state != RagTaskState::Ready) {
+                queue.erase(
+                        queue.begin() +
+                        static_cast<std::ptrdiff_t>(
+                                index));
+                continue;
+            }
+
+            if (!eligible(
+                        task_id,
+                        worker_backend,
+                        stealing)) {
+                ++index;
+                continue;
+            }
+
+            if (!critical_score_policy) {
+                selected = index;
+                break;
+            }
+
+            if (selected ==
+                        std::numeric_limits<
+                                std::size_t>::max() ||
+                node->critical_score >
+                        selected_score) {
+                selected = index;
+                selected_score =
+                        node->critical_score;
+            }
+
+            ++index;
+        }
+
+        if (selected ==
+            std::numeric_limits<std::size_t>::max()) {
+            return -1;
+        }
+
+        const int task_id = queue[selected];
+
+        queue.erase(
+                queue.begin() +
+                static_cast<std::ptrdiff_t>(
+                        selected));
+
+        return task_id;
+    };
+
+    const auto cancel_pending_locked = [&]() {
+        cpu_ready.clear();
+        npu_ready.clear();
+
+        for (auto & node : plan.nodes) {
+            if (node.state == RagTaskState::Pending ||
+                node.state == RagTaskState::Ready) {
+                node.state =
+                        RagTaskState::Cancelled;
+
+                auto & metric =
+                        plan.metrics[node.id];
+
+                metric.task_type = node.type;
+                metric.query_index =
+                        node.query_index;
+                metric.candidate_index =
+                        node.candidate_index;
+                metric.final_state =
+                        RagTaskState::Cancelled;
+            }
+        }
+    };
+
     {
-        std::unique_lock<std::mutex> lk(plan.mtx);
-        for (int i = 0; i < (int)plan.nodes.size(); i++) {
-            if (plan.nodes[i].pending_deps == 0) {
-                plan.nodes[i].state   = RagTaskState::Ready;
-                enqueue_time[plan.nodes[i].id] = now_ms();
-                ready_q.push(plan.nodes[i].id);
+        std::lock_guard<std::mutex> lock(plan.mtx);
+
+        for (auto & node : plan.nodes) {
+            if (node.pending_deps == 0) {
+                enqueue_ready_locked(node.id);
             }
         }
     }
 
-    std::vector<std::thread> threads;
+    std::vector<std::thread> workers;
+    workers.reserve(cpu_workers + npu_workers);
 
-    std::unique_lock<std::mutex> lk(plan.mtx);
+    const auto worker_loop =
+            [&](RagBackend worker_backend,
+                int worker_id) {
+        while (true) {
+            int task_id = -1;
+            bool stolen = false;
 
-    while (true) {
-        // -- cancel path: drain ready queue and mark pending nodes --
-        if (plan.cancel_requested.load()) {
-            while (!ready_q.empty()) {
-                int id = ready_q.front();
-                ready_q.pop();
-                RagTaskNode * n = plan.find_node(id);
-                if (n && (n->state == RagTaskState::Ready ||
-                          n->state == RagTaskState::Pending)) {
-                    n->state                        = RagTaskState::Cancelled;
-                    plan.metrics[id].final_state    = RagTaskState::Cancelled;
-                }
-            }
-            for (int i = 0; i < (int)plan.nodes.size(); i++) {
-                RagTaskState s = plan.nodes[i].state;
-                if (s == RagTaskState::Pending || s == RagTaskState::Ready) {
-                    plan.nodes[i].state                         = RagTaskState::Cancelled;
-                    plan.metrics[plan.nodes[i].id].final_state  = RagTaskState::Cancelled;
-                }
-            }
-            if (active == 0) {
-                break;
-            }
-            // Wait for still-running tasks to finish
-            plan.cv.wait(lk, [&]() { return active == 0; });
-            break;
-        }
+            RagTaskType task_type =
+                    RagTaskType::DocumentEmbedding;
 
-        // -- normal dispatch path --
-        while (!ready_q.empty() && !plan.cancel_requested.load()) {
-            int           task_id  = ready_q.front();
-            ready_q.pop();
-            RagTaskNode * node = plan.find_node(task_id);
-            if (!node || node->state != RagTaskState::Ready) {
-                continue;
-            }
+            std::size_t query_index =
+                    std::numeric_limits<
+                            std::size_t>::max();
 
-            RagTaskType       task_type  = node->type;
-            RagBackend        preferred_backend = node->target_backend;
-            RagBackend        backend    = resolve_backend(
-                    task_type,
-                    preferred_backend);
-            RagTaskExecutor * exec       = find_executor(
-                    task_type,
-                    backend);
-            int64_t           eq_time    = enqueue_time.count(task_id) ?
-                                           enqueue_time[task_id] : now_ms();
+            std::size_t candidate_index =
+                    std::numeric_limits<
+                            std::size_t>::max();
 
-            const std::size_t query_index =
-                    node->query_index;
-            const std::size_t candidate_index =
-                    node->candidate_index;
+            int64_t queued_at = 0;
 
-            plan.metrics[task_id].task_type =
-                    task_type;
-            plan.metrics[task_id].preferred_backend =
-                    preferred_backend;
-            plan.metrics[task_id].query_index =
-                    query_index;
-            plan.metrics[task_id].candidate_index =
-                    candidate_index;
-
-            node->state = RagTaskState::Running;
-            active++;
-
-            // Worker thread: execute task outside the lock, report back under lock
-            threads.emplace_back([this, &plan, &lk, &ready_q, &active, &enqueue_time,
-                                   task_id, task_type, backend, exec, eq_time,
-                                   query_index, candidate_index]()
             {
-                int64_t exec_start = now_ms();
-                int64_t qwait      = exec_start - eq_time;
+                std::unique_lock<std::mutex> lock(
+                        plan.mtx);
 
-                RagTaskResult result;
-                result.task_id = task_id;
+                plan.cv.wait(
+                        lock,
+                        [&]() {
+                            if (plan.cancel_requested.load()) {
+                                return true;
+                            }
 
-                if (exec) {
-                    RagTaskContext ctx;
-                    ctx.task_id         = task_id;
-                    ctx.request_id      = plan.request_id;
-                    ctx.type            = task_type;
-                    ctx.backend         = backend;
-                    ctx.query_index     = query_index;
-                    ctx.candidate_index = candidate_index;
-                    ctx.runtime         = plan.runtime;
-                    result = exec->execute(ctx);
-                } else {
-                    result.success       = false;
-                    result.error_message = "no executor registered";
+                            if (all_terminal(plan) &&
+                                active == 0) {
+                                return true;
+                            }
+
+                            if (serial_policy &&
+                                active != 0) {
+                                return false;
+                            }
+
+                            const auto & own_queue =
+                                    queue_for(
+                                            worker_backend);
+
+                            if (has_eligible(
+                                        own_queue,
+                                        worker_backend,
+                                        false)) {
+                                return true;
+                            }
+
+                            if (allow_stealing) {
+                                const auto & other_queue =
+                                        queue_for(
+                                                other_backend(
+                                                        worker_backend));
+
+                                if (has_eligible(
+                                            other_queue,
+                                            worker_backend,
+                                            true)) {
+                                    return true;
+                                }
+                            }
+
+                            return false;
+                        });
+
+                if (plan.cancel_requested.load()) {
+                    cancel_pending_locked();
+                    return;
                 }
 
-                int64_t exec_end = now_ms();
+                if (all_terminal(plan) &&
+                    active == 0) {
+                    return;
+                }
 
-                // Report completion under the plan mutex
-                std::unique_lock<std::mutex> inner(plan.mtx);
+                if (serial_policy &&
+                    active != 0) {
+                    continue;
+                }
 
-                RagTaskNode * n = plan.find_node(task_id);
-                if (n) {
-                    plan.metrics[task_id].queue_wait_ms =
-                            qwait;
-                    plan.metrics[task_id].execution_ms =
+                auto & own_queue =
+                        queue_for(worker_backend);
+
+                task_id = pop_queue_locked(
+                        own_queue,
+                        worker_backend,
+                        false);
+
+                if (task_id < 0 &&
+                    allow_stealing) {
+                    auto & steal_queue =
+                            queue_for(
+                                    other_backend(
+                                            worker_backend));
+
+                    task_id = pop_queue_locked(
+                            steal_queue,
+                            worker_backend,
+                            true);
+
+                    stolen = task_id >= 0;
+                }
+
+                if (task_id < 0) {
+                    continue;
+                }
+
+                RagTaskNode * node =
+                        plan.find_node(task_id);
+
+                if (!node ||
+                    node->state !=
+                            RagTaskState::Ready) {
+                    continue;
+                }
+
+                task_type = node->type;
+                query_index = node->query_index;
+                candidate_index =
+                        node->candidate_index;
+
+                queued_at =
+                        enqueue_time.count(task_id)
+                                ? enqueue_time[task_id]
+                                : now_ms();
+
+                node->state = RagTaskState::Running;
+                ++active;
+
+                auto & metric =
+                        plan.metrics[task_id];
+
+                metric.task_type = task_type;
+                metric.selected_backend =
+                        worker_backend;
+                metric.query_index =
+                        query_index;
+                metric.candidate_index =
+                        candidate_index;
+                metric.worker_id = worker_id;
+                metric.stolen = stolen;
+                metric.final_state =
+                        RagTaskState::Running;
+            }
+
+            const int64_t exec_start = now_ms();
+
+            RagTaskResult result;
+            result.task_id = task_id;
+
+            try {
+                RagTaskExecutor * executor =
+                        find_executor(
+                                task_type,
+                                worker_backend);
+
+                if (!executor) {
+                    result.success = false;
+                    result.error_message =
+                            "no executor registered";
+                } else {
+                    RagTaskContext context;
+
+                    context.task_id = task_id;
+                    context.request_id =
+                            plan.request_id;
+                    context.type = task_type;
+                    context.backend =
+                            worker_backend;
+                    context.query_index =
+                            query_index;
+                    context.candidate_index =
+                            candidate_index;
+                    context.worker_id =
+                            worker_id;
+                    context.stolen = stolen;
+                    context.runtime =
+                            plan.runtime;
+
+                    result =
+                            executor->execute(context);
+                }
+            } catch (const std::exception & error) {
+                result.success = false;
+                result.error_message =
+                        error.what();
+            } catch (...) {
+                result.success = false;
+                result.error_message =
+                        "executor threw an unknown exception";
+            }
+
+            const int64_t exec_end = now_ms();
+
+            {
+                std::lock_guard<std::mutex> lock(
+                        plan.mtx);
+
+                RagTaskNode * node =
+                        plan.find_node(task_id);
+
+                if (node) {
+                    auto & metric =
+                            plan.metrics[task_id];
+
+                    metric.queue_wait_ms =
+                            exec_start - queued_at;
+                    metric.execution_ms =
                             exec_end - exec_start;
-                    plan.metrics[task_id].start_ms =
-                            exec_start;
-                    plan.metrics[task_id].end_ms =
-                            exec_end;
-                    plan.metrics[task_id].selected_backend =
-                            backend;
-                    plan.metrics[task_id].error_message =
+                    metric.start_ms = exec_start;
+                    metric.end_ms = exec_end;
+                    metric.selected_backend =
+                            worker_backend;
+                    metric.worker_id = worker_id;
+                    metric.stolen = stolen;
+                    metric.error_message =
                             result.error_message;
 
                     if (!result.success) {
-                        n->state                        = RagTaskState::Failed;
-                        plan.metrics[task_id].final_state = RagTaskState::Failed;
-                        propagate_failure(plan, task_id);
-                    } else {
-                        n->state                        = RagTaskState::Completed;
-                        plan.metrics[task_id].final_state = RagTaskState::Completed;
+                        node->state =
+                                RagTaskState::Failed;
 
-                        // Release successors only if not cancelled
+                        metric.final_state =
+                                RagTaskState::Failed;
+
+                        propagate_failure(
+                                plan,
+                                task_id);
+                    } else {
+                        node->state =
+                                RagTaskState::Completed;
+
+                        metric.final_state =
+                                RagTaskState::Completed;
+
                         if (!plan.cancel_requested.load()) {
-                            for (int j = 0; j < (int)n->successors.size(); j++) {
-                                int           succ_id = n->successors[j];
-                                RagTaskNode * succ    = plan.find_node(succ_id);
-                                if (succ && succ->state == RagTaskState::Pending) {
-                                    succ->pending_deps--;
-                                    if (succ->pending_deps == 0) {
-                                        succ->state         = RagTaskState::Ready;
-                                        enqueue_time[succ_id] = now_ms();
-                                        ready_q.push(succ_id);
-                                    }
+                            for (const int successor_id :
+                                 node->successors) {
+                                RagTaskNode * successor =
+                                        plan.find_node(
+                                                successor_id);
+
+                                if (!successor ||
+                                    successor->state !=
+                                            RagTaskState::Pending) {
+                                    continue;
+                                }
+
+                                --successor->pending_deps;
+
+                                if (successor->pending_deps ==
+                                    0) {
+                                    enqueue_ready_locked(
+                                            successor_id);
                                 }
                             }
                         }
                     }
                 }
 
-                active--;
-                plan.cv.notify_one();
-            });
-        }
+                --active;
+            }
 
-        // -- termination check --
-        if (all_terminal(plan) && active == 0) {
-            break;
+            plan.cv.notify_all();
         }
-        if (active == 0 && ready_q.empty()) {
-            // No runnable tasks and none in flight -- stuck or done
-            break;
-        }
+    };
 
-        // Wait for any completion or cancel signal
-        plan.cv.wait(lk, [&]() {
-            return active == 0 || !ready_q.empty() || plan.cancel_requested.load();
-        });
+    for (std::size_t index = 0;
+         index < cpu_workers;
+         ++index) {
+        workers.emplace_back(
+                worker_loop,
+                RagBackend::CPU,
+                static_cast<int>(index));
     }
 
-    lk.unlock();
+    for (std::size_t index = 0;
+         index < npu_workers;
+         ++index) {
+        workers.emplace_back(
+                worker_loop,
+                RagBackend::NPU,
+                1000 + static_cast<int>(index));
+    }
 
-    for (int i = 0; i < (int)threads.size(); i++) {
-        if (threads[i].joinable()) {
-            threads[i].join();
+    plan.cv.notify_all();
+
+    for (auto & worker : workers) {
+        if (worker.joinable()) {
+            worker.join();
         }
     }
 
-    // Success only when every node completed
-    for (int i = 0; i < (int)plan.nodes.size(); i++) {
-        if (plan.nodes[i].state != RagTaskState::Completed) {
+    for (const auto & node : plan.nodes) {
+        if (node.state != RagTaskState::Completed) {
             return false;
         }
     }
+
     return true;
 }

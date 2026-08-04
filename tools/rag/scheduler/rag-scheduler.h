@@ -221,6 +221,15 @@ struct ExecutorKey {
 // The main scheduler: builds and drives execution of a RagExecutionPlan.
 class RagScheduler {
 public:
+    RagScheduler();
+
+    // Configure fixed backend worker counts.
+    // CPU must have at least one worker.
+    // NPU may be zero when no NPU executor is registered.
+    void set_worker_counts(
+            std::size_t cpu_workers,
+            std::size_t npu_workers = 1);
+
     // Register an executor for a specific (task_type, backend) pair.
     // Pointer must remain valid for the lifetime of the scheduler.
     void register_executor(RagTaskType type, RagBackend backend, RagTaskExecutor * executor);
@@ -238,6 +247,9 @@ public:
 private:
     std::map<ExecutorKey, RagTaskExecutor *> executors_;
     std::map<RagTaskType, RagBackend>        routing_;
+
+    std::size_t cpu_worker_count_;
+    std::size_t npu_worker_count_;
 
     RagBackend        resolve_backend(RagTaskType type, RagBackend requested) const;
     RagTaskExecutor * find_executor(RagTaskType type, RagBackend backend) const;
