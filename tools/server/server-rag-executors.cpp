@@ -24,26 +24,172 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
             if (runtime->chunks.empty()) throw std::runtime_error("document produced no chunks");
             runtime->document_embeddings = models_->request_model_embeddings(req.embedding_model, runtime->chunks);
         } else if (type_ == RagTaskType::QueryExpansion) {
-            runtime->expanded_queries = { req.query };
-            if (req.enable_query_expansion) {
-                const std::string model = req.expansion_model.empty() ? req.generation_model : req.expansion_model;
-                const json response = models_->request_model_json(model, "/completion", {
-                    {"prompt", build_query_expansion_prompt(req.query)},
-                    {"n_predict", std::min<std::size_t>(req.max_tokens, 96)},
-                    {"temperature", 0.2F}, {"stream", false}});
-                if (!response.contains("content") || !response["content"].is_string()) throw std::runtime_error("invalid query expansion response");
-                const auto queries = rag_split_sub_queries(response["content"].get<std::string>());
-                if (!queries.empty()) runtime->expanded_queries = queries;
+            runtime->expanded_queries.clear();
+            runtime->expanded_queries.push_back(req.query);
+
+            if (req.enable_query_expansion &&
+                req.max_expanded_queries > 1) {
+                const std::string model =
+                        req.expansion_model.empty()
+                                ? req.generation_model
+                                : req.expansion_model;
+
+                const json response =
+                        models_->request_model_json(
+                                model,
+                                "/completion",
+                                {
+                                    {
+                                        "prompt",
+                                        build_query_expansion_prompt(
+                                                req.query),
+                                    },
+                                    {
+                                        "n_predict",
+                                        std::min<std::size_t>(
+                                                req.max_tokens,
+                                                96),
+                                    },
+                                    {"temperature", 0.2F},
+                                    {"stream", false},
+                                });
+
+                if (!response.contains("content") ||
+                    !response["content"].is_string()) {
+                    throw std::runtime_error(
+                            "invalid query expansion response");
+                }
+
+                const auto queries =
+                        rag_split_sub_queries(
+                                response["content"]
+                                        .get<std::string>(),
+                                req.max_expanded_queries - 1);
+
+                for (const auto & query : queries) {
+                    if (query.empty() || query == req.query) {
+                        continue;
+                    }
+
+                    if (std::find(
+                                runtime->expanded_queries.begin(),
+                                runtime->expanded_queries.end(),
+                                query) !=
+                        runtime->expanded_queries.end()) {
+                        continue;
+                    }
+
+                    runtime->expanded_queries.push_back(query);
+
+                    if (runtime->expanded_queries.size() >=
+                        req.max_expanded_queries) {
+                        break;
+                    }
+                }
             }
         } else if (type_ == RagTaskType::QueryEmbedding) {
-            runtime->query_embeddings = models_->request_model_embeddings(req.embedding_model, runtime->expanded_queries);
+            if (ctx.query_index == RAG_INVALID_INDEX ||
+                ctx.query_index >=
+                        runtime->expanded_queries.size() ||
+                ctx.query_index >=
+                        runtime->query_branches.size()) {
+                throw std::runtime_error(
+                        "QueryEmbedding received an invalid "
+                        "query branch index");
+            }
+
+            const std::string & query =
+                    runtime->expanded_queries.at(
+                            ctx.query_index);
+
+            auto embeddings =
+                    models_->request_model_embeddings(
+                            req.embedding_model,
+                            {query});
+
+            if (embeddings.size() != 1 ||
+                embeddings.front().empty()) {
+                throw std::runtime_error(
+                        "QueryEmbedding expected exactly one "
+                        "non-empty embedding");
+            }
+
+            auto & branch =
+                    runtime->query_branches.at(
+                            ctx.query_index);
+
+            branch.query_index = ctx.query_index;
+            branch.query = query;
+            branch.embedding =
+                    std::move(embeddings.front());
+            branch.error.clear();
+            branch.success = false;
         } else if (type_ == RagTaskType::VectorSearch) {
-            std::vector<std::size_t> indices(runtime->chunks.size());
-            std::iota(indices.begin(), indices.end(), 0);
+            if (ctx.query_index == RAG_INVALID_INDEX ||
+                ctx.query_index >=
+                        runtime->query_branches.size()) {
+                throw std::runtime_error(
+                        "VectorSearch received an invalid "
+                        "query branch index");
+            }
+
+            auto & branch =
+                    runtime->query_branches.at(
+                            ctx.query_index);
+
+            if (branch.embedding.empty()) {
+                throw std::runtime_error(
+                        "VectorSearch has no query embedding");
+            }
+
+            std::vector<std::size_t> indices(
+                    runtime->chunks.size());
+
+            std::iota(
+                    indices.begin(),
+                    indices.end(),
+                    0);
+
+            branch.retrieval_indices =
+                    rag_search_inner_product(
+                            runtime->document_embeddings,
+                            indices,
+                            branch.embedding,
+                            req.top_k);
+
+            branch.success = true;
+            branch.error.clear();
+        } else if (
+                type_ == RagTaskType::RetrievalMerge ||
+                type_ == RagTaskType::CandidateMerge) {
+            runtime->query_embeddings.clear();
             runtime->retrieval_results.clear();
-            for (const auto & embedding : runtime->query_embeddings) runtime->retrieval_results.push_back(rag_search_inner_product(runtime->document_embeddings, indices, embedding, req.top_k));
-        } else if (type_ == RagTaskType::RetrievalMerge || type_ == RagTaskType::CandidateMerge) {
-            runtime->retrieved_indices = rag_merge_subquery_hits(runtime->retrieval_results, req.top_k);
+
+            runtime->query_embeddings.reserve(
+                    runtime->query_branches.size());
+
+            runtime->retrieval_results.reserve(
+                    runtime->query_branches.size());
+
+            for (const auto & branch :
+                 runtime->query_branches) {
+                if (!branch.success) {
+                    throw std::runtime_error(
+                            "RetrievalMerge received an "
+                            "incomplete query branch");
+                }
+
+                runtime->query_embeddings.push_back(
+                        branch.embedding);
+
+                runtime->retrieval_results.push_back(
+                        branch.retrieval_indices);
+            }
+
+            runtime->retrieved_indices =
+                    rag_merge_subquery_hits(
+                            runtime->retrieval_results,
+                            req.top_k);
         } else if (type_ == RagTaskType::Reranking) {
             std::vector<std::string> candidates;
             for (auto index : runtime->retrieved_indices) if (index < runtime->chunks.size()) candidates.push_back(runtime->chunks[index]);
@@ -96,7 +242,12 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
         }
         result.success = true;
     } catch (const std::exception & e) {
-        runtime->error = e.what();
+        {
+            std::lock_guard<std::mutex> lock(runtime->mutex);
+            if (runtime->error.empty()) {
+                runtime->error = e.what();
+            }
+        }
         result.error_message = e.what();
     }
     return result;

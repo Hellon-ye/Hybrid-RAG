@@ -1933,36 +1933,139 @@ void server_models_routes::init_routes() {
 
         const std::string requested_mode = json_value(body, "mode", std::string("sequential"));
         if (requested_mode == "hetero_parallel") {
-            auto runtime = std::make_shared<RagRequestRuntime>();
-            runtime->request.doc = json_value(body, "doc", std::string());
-            runtime->request.query = json_value(body, "query", std::string());
-            runtime->request.generation_model = json_value(body, "generation_model", std::string());
-            runtime->request.embedding_model = json_value(body, "embedding_model", std::string());
-            runtime->request.rerank_model = json_value(body, "rerank_model", std::string());
-            runtime->request.expansion_model = json_value(body, "expansion_model", std::string());
-            runtime->request.enable_query_expansion = json_value(body, "enable_query_expansion", false);
-            runtime->request.top_k = json_value(body, "top_k", std::size_t(20));
-            runtime->request.top_n = json_value(body, "top_n", std::size_t(5));
-            runtime->request.max_tokens = json_value(body, "max_tokens", std::size_t(64));
-            runtime->request.temperature = json_value(body, "temperature", 0.1F);
+            auto runtime =
+                    std::make_shared<RagRequestRuntime>();
+
+            runtime->request_id =
+                    static_cast<std::uint64_t>(
+                            ggml_time_us());
+
+            runtime->request.mode =
+                    requested_mode;
+
+            runtime->request.doc =
+                    json_value(
+                            body,
+                            "doc",
+                            std::string());
+
+            runtime->request.query =
+                    json_value(
+                            body,
+                            "query",
+                            std::string());
+
+            runtime->request.generation_model =
+                    json_value(
+                            body,
+                            "generation_model",
+                            std::string());
+
+            runtime->request.embedding_model =
+                    json_value(
+                            body,
+                            "embedding_model",
+                            std::string());
+
+            runtime->request.rerank_model =
+                    json_value(
+                            body,
+                            "rerank_model",
+                            std::string());
+
+            runtime->request.expansion_model =
+                    json_value(
+                            body,
+                            "expansion_model",
+                            std::string());
+
+            runtime->request.enable_query_expansion =
+                    json_value(
+                            body,
+                            "enable_query_expansion",
+                            false);
+
+            runtime->request.max_expanded_queries =
+                    json_value(
+                            body,
+                            "max_expanded_queries",
+                            std::size_t(3));
+
+            runtime->request.top_k =
+                    json_value(
+                            body,
+                            "top_k",
+                            std::size_t(20));
+
+            runtime->request.top_n =
+                    json_value(
+                            body,
+                            "top_n",
+                            std::size_t(5));
+
+            runtime->request.max_tokens =
+                    json_value(
+                            body,
+                            "max_tokens",
+                            std::size_t(64));
+
+            runtime->request.temperature =
+                    json_value(
+                            body,
+                            "temperature",
+                            0.1F);
+
+            runtime->request.seed =
+                    json_value(
+                            body,
+                            "seed",
+                            std::uint32_t(1234));
+
             runtime->request.generation_prefill_backend =
                     json_value(
                             body,
                             "generation_prefill_backend",
                             std::string("npu"));
+
             runtime->request.generation_decode_backend =
                     json_value(
                             body,
                             "generation_decode_backend",
                             std::string("cpu"));
-            if (runtime->request.doc.empty() || runtime->request.query.empty() || runtime->request.generation_model.empty() || runtime->request.embedding_model.empty()) {
-                res_err(res, format_error_response("doc, query, generation_model and embedding_model are required", ERROR_TYPE_INVALID_REQUEST));
+
+            const RagRequest & rag_request =
+                    runtime->request;
+
+            if (rag_request.doc.empty() ||
+                rag_request.query.empty() ||
+                rag_request.generation_model.empty() ||
+                rag_request.embedding_model.empty()) {
+                res_err(
+                        res,
+                        format_error_response(
+                                "doc, query, generation_model "
+                                "and embedding_model are required",
+                                ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
-            RagExecutionPlan plan;
-            plan.request_id = static_cast<int>(ggml_time_us() & 0x7fffffff);
-            plan.runtime = runtime.get();
-            const RagTaskType types[] = {
+
+            if (rag_request.max_expanded_queries == 0 ||
+                rag_request.top_k == 0 ||
+                rag_request.top_n == 0 ||
+                rag_request.max_tokens == 0) {
+                res_err(
+                        res,
+                        format_error_response(
+                                "max_expanded_queries, top_k, "
+                                "top_n and max_tokens must be "
+                                "greater than zero",
+                                ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+
+            RagScheduler scheduler;
+
+            const RagTaskType executor_types[] = {
                 RagTaskType::DocumentEmbedding,
                 RagTaskType::QueryExpansion,
                 RagTaskType::QueryEmbedding,
@@ -1972,26 +2075,400 @@ void server_models_routes::init_routes() {
                 RagTaskType::Generation,
                 RagTaskType::Finalize,
             };
-            std::vector<std::unique_ptr<RagServerExecutor>> executors;
-            RagScheduler scheduler;
-            for (int i = 0; i < static_cast<int>(sizeof(types) / sizeof(types[0])); ++i) {
-                // The Router executor itself runs on the Host.
-                // The Generation child performs the real NPU Prefill
-                // followed by CPU Decode internally.
-                const RagBackend backend = RagBackend::CPU;
-                plan.add_node(i, types[i], backend);
-                if (i > 0) plan.add_dependency(i - 1, i);
-                executors.emplace_back(new RagServerExecutor(&models, types[i]));
-                scheduler.register_executor(types[i], backend, executors.back().get());
+
+            std::vector<
+                    std::unique_ptr<RagServerExecutor>>
+                    executors;
+
+            executors.reserve(
+                    sizeof(executor_types) /
+                    sizeof(executor_types[0]));
+
+            for (const RagTaskType type :
+                 executor_types) {
+                executors.emplace_back(
+                        new RagServerExecutor(
+                                &models,
+                                type));
+
+                scheduler.register_executor(
+                        type,
+                        RagBackend::CPU,
+                        executors.back().get());
             }
-            if (!scheduler.run(plan)) {
-                std::string error = runtime->error.empty() ? "heterogeneous RAG execution failed" : runtime->error;
-                res_err(res, format_error_response(error, ERROR_TYPE_SERVER));
+
+            // ----------------------------------------------------------
+            // Phase A:
+            // DocumentEmbedding and QueryExpansion have no dependency
+            // and are therefore dispatched concurrently.
+            // ----------------------------------------------------------
+
+            RagExecutionPlan phase_a;
+            phase_a.request_id =
+                    static_cast<int>(
+                            runtime->request_id &
+                            0x7fffffffU);
+            phase_a.policy =
+                    RagSchedulePolicy::HeteroParallel;
+            phase_a.runtime = runtime.get();
+
+            phase_a.add_node(
+                    0,
+                    RagTaskType::DocumentEmbedding,
+                    RagBackend::CPU);
+
+            phase_a.add_node(
+                    1,
+                    RagTaskType::QueryExpansion,
+                    RagBackend::CPU);
+
+            if (!scheduler.run(phase_a)) {
+                const std::string error =
+                        runtime->error.empty()
+                                ? "RAG preparation phase failed"
+                                : runtime->error;
+
+                res_err(
+                        res,
+                        format_error_response(
+                                error,
+                                ERROR_TYPE_SERVER));
                 return res;
             }
+
+            if (runtime->expanded_queries.empty()) {
+                res_err(
+                        res,
+                        format_error_response(
+                                "query expansion produced no "
+                                "queries",
+                                ERROR_TYPE_SERVER));
+                return res;
+            }
+
+            runtime->query_branches.clear();
+            runtime->query_branches.resize(
+                    runtime->expanded_queries.size());
+
+            for (std::size_t index = 0;
+                 index <
+                         runtime->query_branches.size();
+                 ++index) {
+                runtime->query_branches[index]
+                        .query_index = index;
+
+                runtime->query_branches[index]
+                        .query =
+                        runtime->expanded_queries[index];
+            }
+
+            // ----------------------------------------------------------
+            // Phase B:
+            // Each expanded query gets an independent
+            // QueryEmbedding -> VectorSearch branch.
+            // RetrievalMerge waits for every branch.
+            // ----------------------------------------------------------
+
+            RagExecutionPlan phase_b;
+            phase_b.request_id =
+                    phase_a.request_id;
+            phase_b.policy =
+                    RagSchedulePolicy::HeteroParallel;
+            phase_b.runtime = runtime.get();
+
+            constexpr int branch_base_id = 100;
+            constexpr int merge_id = 100000;
+            constexpr int rerank_id = 100001;
+            constexpr int generation_id = 100002;
+            constexpr int finalize_id = 100003;
+
+            for (std::size_t query_index = 0;
+                 query_index <
+                         runtime->expanded_queries.size();
+                 ++query_index) {
+                const int embedding_id =
+                        branch_base_id +
+                        static_cast<int>(
+                                query_index * 2);
+
+                const int search_id =
+                        embedding_id + 1;
+
+                phase_b.add_node(
+                        embedding_id,
+                        RagTaskType::QueryEmbedding,
+                        RagBackend::CPU);
+
+                phase_b.add_node(
+                        search_id,
+                        RagTaskType::VectorSearch,
+                        RagBackend::CPU);
+
+                auto * embedding_node =
+                        phase_b.find_node(
+                                embedding_id);
+
+                auto * search_node =
+                        phase_b.find_node(
+                                search_id);
+
+                if (!embedding_node ||
+                    !search_node) {
+                    res_err(
+                            res,
+                            format_error_response(
+                                    "failed to construct "
+                                    "query branch nodes",
+                                    ERROR_TYPE_SERVER));
+                    return res;
+                }
+
+                embedding_node->query_index =
+                        query_index;
+
+                search_node->query_index =
+                        query_index;
+
+                phase_b.add_dependency(
+                        embedding_id,
+                        search_id);
+            }
+
+            phase_b.add_node(
+                    merge_id,
+                    RagTaskType::RetrievalMerge,
+                    RagBackend::CPU);
+
+            phase_b.add_node(
+                    rerank_id,
+                    RagTaskType::Reranking,
+                    RagBackend::CPU);
+
+            phase_b.add_node(
+                    generation_id,
+                    RagTaskType::Generation,
+                    RagBackend::CPU);
+
+            phase_b.add_node(
+                    finalize_id,
+                    RagTaskType::Finalize,
+                    RagBackend::CPU);
+
+            for (std::size_t query_index = 0;
+                 query_index <
+                         runtime->expanded_queries.size();
+                 ++query_index) {
+                const int search_id =
+                        branch_base_id +
+                        static_cast<int>(
+                                query_index * 2) +
+                        1;
+
+                phase_b.add_dependency(
+                        search_id,
+                        merge_id);
+            }
+
+            phase_b.add_dependency(
+                    merge_id,
+                    rerank_id);
+
+            phase_b.add_dependency(
+                    rerank_id,
+                    generation_id);
+
+            phase_b.add_dependency(
+                    generation_id,
+                    finalize_id);
+
+            if (!scheduler.run(phase_b)) {
+                const std::string error =
+                        runtime->error.empty()
+                                ? "RAG fan-out execution failed"
+                                : runtime->error;
+
+                res_err(
+                        res,
+                        format_error_response(
+                                error,
+                                ERROR_TYPE_SERVER));
+                return res;
+            }
+
+            const auto task_type_name =
+                    [](RagTaskType type)
+                            -> const char * {
+                switch (type) {
+                    case RagTaskType::DocumentEmbedding:
+                        return "document_embedding";
+                    case RagTaskType::QueryExpansion:
+                        return "query_expansion";
+                    case RagTaskType::QueryEmbedding:
+                        return "query_embedding";
+                    case RagTaskType::VectorSearch:
+                        return "vector_search";
+                    case RagTaskType::RetrievalMerge:
+                        return "retrieval_merge";
+                    case RagTaskType::Reranking:
+                        return "reranking";
+                    case RagTaskType::Generation:
+                        return "generation";
+                    case RagTaskType::GenerationPrefill:
+                        return "generation_prefill";
+                    case RagTaskType::GenerationDecode:
+                        return "generation_decode";
+                    case RagTaskType::CandidateMerge:
+                        return "candidate_merge";
+                    case RagTaskType::Finalize:
+                        return "finalize";
+                }
+
+                return "unknown";
+            };
+
+            const auto backend_name =
+                    [](RagBackend backend)
+                            -> const char * {
+                switch (backend) {
+                    case RagBackend::CPU:
+                        return "cpu";
+                    case RagBackend::NPU:
+                        return "npu";
+                    case RagBackend::Auto:
+                        return "auto";
+                }
+
+                return "unknown";
+            };
+
             json node_metrics = json::array();
-            for (const auto & metric : plan.metrics) node_metrics.push_back({{"node_id", metric.first}, {"queue_wait_ms", metric.second.queue_wait_ms}, {"execution_ms", metric.second.execution_ms}, {"backend", metric.second.selected_backend == RagBackend::NPU ? "npu" : "cpu"}});
-            res_ok(res, {{"answer", runtime->final_answer}, {"context_chunks", runtime->reranked_chunks}, {"mode_requested", requested_mode}, {"mode_used", "hetero_parallel"}, {"scheduler_metrics", node_metrics}, {"stage_metrics", {{"total_ms", static_cast<std::size_t>(ggml_time_ms() - total_start_ms)}}}});
+
+            const auto append_metrics =
+                    [&](const RagExecutionPlan & plan) {
+                for (const auto & entry :
+                     plan.metrics) {
+                    const auto & metric =
+                            entry.second;
+
+                    json item = {
+                        {"node_id", entry.first},
+                        {
+                            "task_type",
+                            task_type_name(
+                                    metric.task_type),
+                        },
+                        {
+                            "queue_wait_ms",
+                            metric.queue_wait_ms,
+                        },
+                        {
+                            "execution_ms",
+                            metric.execution_ms,
+                        },
+                        {
+                            "start_ms",
+                            metric.start_ms,
+                        },
+                        {
+                            "end_ms",
+                            metric.end_ms,
+                        },
+                        {
+                            "preferred_backend",
+                            backend_name(
+                                    metric
+                                            .preferred_backend),
+                        },
+                        {
+                            "actual_backend",
+                            backend_name(
+                                    metric
+                                            .selected_backend),
+                        },
+                    };
+
+                    if (metric.query_index !=
+                        RAG_INVALID_INDEX) {
+                        item["query_index"] =
+                                metric.query_index;
+                    }
+
+                    if (metric.candidate_index !=
+                        RAG_INVALID_INDEX) {
+                        item["candidate_index"] =
+                                metric.candidate_index;
+                    }
+
+                    node_metrics.push_back(
+                            std::move(item));
+                }
+            };
+
+            append_metrics(phase_a);
+            append_metrics(phase_b);
+
+            json branch_results = json::array();
+
+            for (const auto & branch :
+                 runtime->query_branches) {
+                branch_results.push_back({
+                    {
+                        "query_index",
+                        branch.query_index,
+                    },
+                    {"query", branch.query},
+                    {
+                        "retrieval_indices",
+                        branch.retrieval_indices,
+                    },
+                    {"success", branch.success},
+                });
+            }
+
+            res_ok(
+                    res,
+                    {
+                        {
+                            "answer",
+                            runtime->final_answer,
+                        },
+                        {
+                            "sub_queries",
+                            runtime->expanded_queries,
+                        },
+                        {
+                            "query_branches",
+                            branch_results,
+                        },
+                        {
+                            "context_chunks",
+                            runtime->reranked_chunks,
+                        },
+                        {
+                            "mode_requested",
+                            requested_mode,
+                        },
+                        {
+                            "mode_used",
+                            "hetero_parallel",
+                        },
+                        {
+                            "scheduler_metrics",
+                            node_metrics,
+                        },
+                        {
+                            "stage_metrics",
+                            {
+                                {
+                                    "total_ms",
+                                    static_cast<std::size_t>(
+                                            ggml_time_ms() -
+                                            total_start_ms),
+                                },
+                            },
+                        },
+                    });
+
             return res;
         }
 

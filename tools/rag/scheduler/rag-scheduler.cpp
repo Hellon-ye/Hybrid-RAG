@@ -391,17 +391,37 @@ bool RagScheduler::run(RagExecutionPlan & plan)
             }
 
             RagTaskType       task_type  = node->type;
-            RagBackend        backend    = resolve_backend(task_type, node->target_backend);
-            RagTaskExecutor * exec       = find_executor(task_type, backend);
+            RagBackend        preferred_backend = node->target_backend;
+            RagBackend        backend    = resolve_backend(
+                    task_type,
+                    preferred_backend);
+            RagTaskExecutor * exec       = find_executor(
+                    task_type,
+                    backend);
             int64_t           eq_time    = enqueue_time.count(task_id) ?
                                            enqueue_time[task_id] : now_ms();
+
+            const std::size_t query_index =
+                    node->query_index;
+            const std::size_t candidate_index =
+                    node->candidate_index;
+
+            plan.metrics[task_id].task_type =
+                    task_type;
+            plan.metrics[task_id].preferred_backend =
+                    preferred_backend;
+            plan.metrics[task_id].query_index =
+                    query_index;
+            plan.metrics[task_id].candidate_index =
+                    candidate_index;
 
             node->state = RagTaskState::Running;
             active++;
 
             // Worker thread: execute task outside the lock, report back under lock
             threads.emplace_back([this, &plan, &lk, &ready_q, &active, &enqueue_time,
-                                   task_id, task_type, backend, exec, eq_time]()
+                                   task_id, task_type, backend, exec, eq_time,
+                                   query_index, candidate_index]()
             {
                 int64_t exec_start = now_ms();
                 int64_t qwait      = exec_start - eq_time;
@@ -411,11 +431,13 @@ bool RagScheduler::run(RagExecutionPlan & plan)
 
                 if (exec) {
                     RagTaskContext ctx;
-                    ctx.task_id    = task_id;
-                    ctx.request_id = plan.request_id;
-                    ctx.type       = task_type;
-                    ctx.backend    = backend;
-                    ctx.runtime    = plan.runtime;
+                    ctx.task_id         = task_id;
+                    ctx.request_id      = plan.request_id;
+                    ctx.type            = task_type;
+                    ctx.backend         = backend;
+                    ctx.query_index     = query_index;
+                    ctx.candidate_index = candidate_index;
+                    ctx.runtime         = plan.runtime;
                     result = exec->execute(ctx);
                 } else {
                     result.success       = false;
@@ -429,10 +451,18 @@ bool RagScheduler::run(RagExecutionPlan & plan)
 
                 RagTaskNode * n = plan.find_node(task_id);
                 if (n) {
-                    plan.metrics[task_id].queue_wait_ms    = qwait;
-                    plan.metrics[task_id].execution_ms     = exec_end - exec_start;
-                    plan.metrics[task_id].selected_backend = backend;
-                    plan.metrics[task_id].error_message    = result.error_message;
+                    plan.metrics[task_id].queue_wait_ms =
+                            qwait;
+                    plan.metrics[task_id].execution_ms =
+                            exec_end - exec_start;
+                    plan.metrics[task_id].start_ms =
+                            exec_start;
+                    plan.metrics[task_id].end_ms =
+                            exec_end;
+                    plan.metrics[task_id].selected_backend =
+                            backend;
+                    plan.metrics[task_id].error_message =
+                            result.error_message;
 
                     if (!result.success) {
                         n->state                        = RagTaskState::Failed;
