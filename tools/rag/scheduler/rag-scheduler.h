@@ -4,6 +4,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <map>
+#include <limits>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -32,6 +33,15 @@ enum class RagBackend {
     Auto,
 };
 
+
+// Scheduling policy used for one execution plan.
+enum class RagSchedulePolicy {
+    Sequential = 0,
+    CarrierBaseline,
+    HeteroParallel,
+    NpuCpuCriticalScore,
+};
+
 // Task lifecycle states
 enum class RagTaskState {
     Pending = 0,
@@ -47,6 +57,17 @@ struct RagTaskNode {
     int              id;
     RagTaskType      type;
     RagBackend       target_backend;
+
+    // Branch metadata. RAG_INVALID_INDEX is represented here by size_t max.
+    std::size_t      query_index = std::numeric_limits<std::size_t>::max();
+    std::size_t      candidate_index = std::numeric_limits<std::size_t>::max();
+
+    // A fixed Generation Prefill/Decode node has one allowed backend and
+    // stealable=false. General RAG stages may allow CPU and NPU.
+    std::vector<RagBackend> allowed_backends;
+    bool                    stealable = true;
+    double                  critical_score = 0.0;
+
     std::vector<int> predecessors;
     std::vector<int> successors;
     RagTaskState     state;
@@ -65,8 +86,19 @@ struct RagTaskNode {
 struct RagTaskMetrics {
     int64_t      queue_wait_ms;
     int64_t      execution_ms;
+    RagTaskType  task_type = RagTaskType::DocumentEmbedding;
+    RagBackend   preferred_backend = RagBackend::Auto;
     RagBackend   selected_backend;
     RagTaskState final_state;
+
+    std::size_t  query_index = std::numeric_limits<std::size_t>::max();
+    std::size_t  candidate_index = std::numeric_limits<std::size_t>::max();
+
+    int64_t      start_ms = 0;
+    int64_t      end_ms = 0;
+    int          worker_id = -1;
+    bool         stolen = false;
+
     std::string  error_message;
 
     RagTaskMetrics()
@@ -81,6 +113,7 @@ struct RagTaskMetrics {
 // Non-copyable because of internal mutex/cv.
 struct RagExecutionPlan {
     int                           request_id;
+    RagSchedulePolicy             policy = RagSchedulePolicy::Sequential;
     void *                        runtime;
     std::vector<RagTaskNode>      nodes;
     std::map<int, RagTaskMetrics> metrics;
@@ -124,6 +157,13 @@ struct RagTaskContext {
     int         request_id;
     RagTaskType type;
     RagBackend  backend;
+
+    std::size_t query_index = std::numeric_limits<std::size_t>::max();
+    std::size_t candidate_index = std::numeric_limits<std::size_t>::max();
+
+    int         worker_id = -1;
+    bool        stolen = false;
+
     void *      runtime;
 };
 
