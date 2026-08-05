@@ -62,6 +62,20 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
                 "Export the formal Generation Prefill/Decode handoff "
                 "containing Prompt sequence state and final Prefill logits"));
 
+    add((new field_bool(
+                "generation_prefill_only",
+                params.generation_prefill_only))
+        ->set_desc(
+                "Stop after Generation Prefill, retain the exported "
+                "handoff on the server, and return a lightweight handle"));
+
+    add((new field_num<std::uint64_t>(
+                "generation_handoff_handle",
+                params.generation_handoff_handle))
+        ->set_desc(
+                "Consume a previously retained Generation handoff and "
+                "continue with Decode without repeating Prefill"));
+
     add((new field_str("generation_prefill_backend"))
         ->set_desc(
                 "Backend used for Generation Prefill: auto, cpu, or npu")
@@ -591,7 +605,35 @@ task_params eval_llama_cmpl_schema(
         auto reasoning_format = params.chat_parser_params.reasoning_format;
         params.chat_parser_params.reasoning_in_content = params.stream && (reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY);
 
+        if (params.generation_prefill_only &&
+                !params.generation_handoff) {
+            throw std::invalid_argument(
+                    "Field 'generation_prefill_only' requires "
+                    "'generation_handoff=true'");
+        }
+
+        if (params.generation_handoff_handle != 0 &&
+                !params.generation_handoff) {
+            throw std::invalid_argument(
+                    "Field 'generation_handoff_handle' requires "
+                    "'generation_handoff=true'");
+        }
+
+        if (params.generation_handoff_handle != 0 &&
+                params.generation_prefill_only) {
+            throw std::invalid_argument(
+                    "Fields 'generation_handoff_handle' and "
+                    "'generation_prefill_only=true' are mutually exclusive");
+        }
+
         if (params.generation_handoff) {
+            if (params.generation_prefill_only &&
+                    params.stream) {
+                throw std::invalid_argument(
+                        "Field 'generation_prefill_only' does not "
+                        "support streaming");
+            }
+
             // AUTO resolves only to a registered backend. The current
             // permanent reference backend is CPU Prefill -> CPU Decode.
             if (params.generation_prefill_backend == "auto") {

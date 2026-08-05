@@ -80,6 +80,8 @@ json task_params::to_json(bool only_metrics) const {
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
             {"generation_handoff",         generation_handoff},
+            {"generation_prefill_only",     generation_prefill_only},
+            {"generation_handoff_handle",   generation_handoff_handle},
             {"generation_prefill_backend", generation_prefill_backend},
             {"generation_decode_backend",  generation_decode_backend},
             {"backend_sampling",          sampling.backend_sampling},
@@ -140,6 +142,8 @@ json task_params::to_json(bool only_metrics) const {
         {"timings_per_token",         timings_per_token},
         {"post_sampling_probs",       post_sampling_probs},
         {"generation_handoff",         generation_handoff},
+        {"generation_prefill_only",     generation_prefill_only},
+        {"generation_handoff_handle",   generation_handoff_handle},
         {"generation_prefill_backend", generation_prefill_backend},
         {"generation_decode_backend",  generation_decode_backend},
         {"backend_sampling",          sampling.backend_sampling},
@@ -386,6 +390,18 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         {"tokens_cached",       n_tokens_cached},
         {"timings",             timings.to_json()},
     };
+    if (generation_prefill_only) {
+        res["generation_prefill_only"] = true;
+        res["generation_handoff_handle"] =
+                generation_handoff_handle;
+        res["generation_handoff_state_bytes"] =
+                generation_handoff_state_bytes;
+        res["generation_handoff_logits_count"] =
+                generation_handoff_logits_count;
+        res["generation_handoff_producer_backend"] =
+                generation_handoff_producer_backend;
+    }
+
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
     }

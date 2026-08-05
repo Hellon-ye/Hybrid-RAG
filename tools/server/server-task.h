@@ -59,6 +59,8 @@ struct task_params {
     // final Prefill logits before any generated token is sampled.
     // The Decode backend owns the sampler and RNG from the first token.
     bool generation_handoff = false;
+    bool generation_prefill_only = false;
+    std::uint64_t generation_handoff_handle = 0;
 
     std::string generation_prefill_backend = "cpu";
     std::string generation_decode_backend  = "cpu";
@@ -370,6 +372,12 @@ struct server_task_result_cmpl_final : server_task_result {
     std::vector<std::string>  response_fields;
 
     task_params generation_params;
+
+    bool generation_prefill_only = false;
+    std::uint64_t generation_handoff_handle = 0;
+    std::size_t generation_handoff_state_bytes = 0;
+    std::size_t generation_handoff_logits_count = 0;
+    std::string generation_handoff_producer_backend;
 
     // response formatting
     bool               verbose  = false;

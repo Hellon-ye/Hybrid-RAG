@@ -27,6 +27,7 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <unordered_map>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -906,6 +907,16 @@ private:
     common_init_result_ptr generation_decode_init_cpu;
     llama_model * generation_decode_model_cpu = nullptr;
 
+    static constexpr std::size_t
+            MAX_STORED_GENERATION_HANDOFFS = 64;
+
+    std::unordered_map<
+            std::uint64_t,
+            std::unique_ptr<server_generation_handoff>>
+            generation_handoffs;
+
+    std::uint64_t next_generation_handoff_handle = 1;
+
     llama_context * ctx_tgt = nullptr;
 
     server_batch batch;
@@ -995,6 +1006,9 @@ private:
             slot.generation_decode_executor.reset();
             slot.generation_handoff.reset();
         }
+
+        generation_handoffs.clear();
+        next_generation_handoff_handle = 1;
 
         spec.reset();
         spec_init.reset();
@@ -1817,6 +1831,93 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        const std::uint64_t generation_handoff_handle =
+                task.params.generation_handoff_handle;
+
+        server_generation_handoff * stored_generation_handoff = nullptr;
+
+        if (generation_handoff_handle != 0) {
+            if (!task.params.generation_handoff) {
+                send_error(
+                        task,
+                        "generation_handoff_handle requires "
+                        "generation_handoff=true",
+                        ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+
+            if (task.params.generation_prefill_only) {
+                send_error(
+                        task,
+                        "generation_handoff_handle cannot be combined with "
+                        "generation_prefill_only=true",
+                        ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+
+            if (task.type != SERVER_TASK_TYPE_COMPLETION &&
+                    task.type != SERVER_TASK_TYPE_INFILL) {
+                send_error(
+                        task,
+                        "Generation handoff consumption is only supported "
+                        "for completion or infill tasks",
+                        ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+
+            if (task.tokens.has_mtmd) {
+                send_error(
+                        task,
+                        "Generation handoff consumption does not support "
+                        "multimodal input",
+                        ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+
+            if (task.is_parent() || task.is_child()) {
+                send_error(
+                        task,
+                        "Generation handoff consumption does not support "
+                        "parent or child completion tasks",
+                        ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+
+            const auto handoff_it =
+                    generation_handoffs.find(generation_handoff_handle);
+
+            if (handoff_it == generation_handoffs.end() ||
+                    !handoff_it->second) {
+                send_error(
+                        task,
+                        string_format(
+                                "Generation handoff handle %" PRIu64
+                                " was not found or has already been consumed",
+                                generation_handoff_handle),
+                        ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+
+            stored_generation_handoff = handoff_it->second.get();
+
+            // The stored handoff is authoritative for Prompt identity and
+            // sampling state. The consumer request controls only continuation
+            // limits and response behavior such as n_predict and streaming.
+            task.tokens.clear();
+            task.tokens.insert(
+                    stored_generation_handoff->prompt_tokens);
+
+            task.params.sampling =
+                    stored_generation_handoff->sampling_params;
+
+            task.params.generation_prefill_backend =
+                    stored_generation_handoff->producer_backend;
+
+            // Prefill progress is already complete and belongs to the
+            // producer request.
+            task.params.return_progress = false;
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -1832,6 +1933,16 @@ private:
             }
         } else {
             slot.lora = params_base.lora_adapters;
+        }
+
+        if (stored_generation_handoff != nullptr &&
+                !slot.lora.empty()) {
+            send_error(
+                    task,
+                    "Generation handoff consumption does not support "
+                    "LoRA or aLoRA adapters",
+                    ERROR_TYPE_INVALID_REQUEST);
+            return false;
         }
 
         // if using alora, make sure it's only a single one requested and active
@@ -1929,6 +2040,125 @@ private:
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
+
+        if (stored_generation_handoff != nullptr) {
+            llama_token first_token = LLAMA_TOKEN_NULL;
+
+            try {
+                if (slot.task->params.generation_decode_backend !=
+                        "cpu") {
+                    throw std::runtime_error(
+                            "only the CPU Generation Decode executor "
+                            "is currently registered");
+                }
+
+                auto decode_context_params =
+                        common_context_params_to_llama(params_base);
+
+                decode_context_params.n_ctx =
+                        static_cast<uint32_t>(slot.n_ctx);
+                decode_context_params.n_seq_max = 1;
+
+                llama_model * decode_model = nullptr;
+
+                const std::string & producer_backend =
+                        stored_generation_handoff->producer_backend;
+
+                if (producer_backend == "npu") {
+                    // Never restore an NPU-produced handoff into the
+                    // HTP-backed Producer model.
+                    decode_model = generation_decode_model_cpu;
+                } else if (producer_backend == "cpu") {
+                    decode_model =
+                            generation_decode_model_cpu != nullptr
+                                ? generation_decode_model_cpu
+                                : model_tgt;
+                } else {
+                    throw std::runtime_error(
+                            "stored Generation handoff has an unsupported "
+                            "Producer backend");
+                }
+
+                if (decode_model == nullptr) {
+                    throw std::runtime_error(
+                            "Generation Decode model is unavailable");
+                }
+
+                slot.t_start_process_prompt = ggml_time_us();
+                slot.t_start_generation = 0;
+                slot.t_prompt_processing = 0.0;
+                slot.t_token_generation = 0.0;
+                slot.n_prompt_tokens_cache = 0;
+                slot.n_prompt_tokens_processed =
+                        static_cast<int32_t>(
+                                stored_generation_handoff
+                                        ->prompt_tokens.size());
+
+                slot.generation_decode_executor =
+                        std::make_unique<
+                                server_generation_decode_executor>(
+                                    decode_model,
+                                    decode_context_params,
+                                    0);
+
+                // begin() validates and restores the sequence state,
+                // reconstructs the sampler, and samples the first token.
+                first_token =
+                        slot.generation_decode_executor->begin(
+                                *stored_generation_handoff);
+            } catch (const std::exception & e) {
+                slot.generation_decode_executor.reset();
+
+                send_error(
+                        slot,
+                        std::string(
+                                "Failed to consume Generation handoff: ") +
+                                e.what(),
+                        ERROR_TYPE_SERVER);
+
+                slot.release();
+                return false;
+            }
+
+            // One-shot ownership: retain the handoff on every failure before
+            // begin(), but permanently consume it once begin() succeeds.
+            generation_handoffs.erase(generation_handoff_handle);
+
+            slot.state = SLOT_STATE_GENERATING;
+
+            SLT_INF(
+                    slot,
+                    "Generation handoff consumed: handle=%" PRIu64
+                    ", prompt_tokens=%d, producer_backend=%s\n",
+                    generation_handoff_handle,
+                    slot.n_prompt_tokens_processed,
+                    slot.task->params
+                            .generation_prefill_backend.c_str());
+
+            try {
+                process_generation_token(
+                        slot,
+                        first_token,
+                        -1,
+                        false);
+            } catch (const std::exception & e) {
+                send_error(
+                        slot,
+                        std::string(
+                                "Generation Decode failed after handoff "
+                                "consumption: ") +
+                                e.what(),
+                        ERROR_TYPE_SERVER);
+
+                slot.release();
+                return false;
+            }
+
+            // The first token may already have completed and released the
+            // request. Otherwise pre_decode() advances this active executor.
+            n_empty_consecutive = 0;
+            return true;
+        }
 
         // reset server kill-switch counter
         n_empty_consecutive = 0;
@@ -2302,7 +2532,13 @@ private:
         queue_results.send(std::move(res));
     }
 
-    void send_final_response(server_slot & slot) {
+    void send_final_response(
+            server_slot & slot,
+            bool generation_prefill_only = false,
+            std::uint64_t generation_handoff_handle = 0,
+            std::size_t generation_handoff_state_bytes = 0,
+            std::size_t generation_handoff_logits_count = 0,
+            std::string generation_handoff_producer_backend = {}) {
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -2361,6 +2597,22 @@ private:
         }
 
         res->generation_params = slot.task->params; // copy the parameters
+
+        res->generation_prefill_only =
+                generation_prefill_only;
+
+        res->generation_handoff_handle =
+                generation_handoff_handle;
+
+        res->generation_handoff_state_bytes =
+                generation_handoff_state_bytes;
+
+        res->generation_handoff_logits_count =
+                generation_handoff_logits_count;
+
+        res->generation_handoff_producer_backend =
+                std::move(
+                        generation_handoff_producer_backend);
 
         queue_results.send(std::move(res));
     }
@@ -4145,6 +4397,81 @@ private:
                     throw std::runtime_error(
                             "Generation handoff does not currently "
                             "support LoRA or aLoRA adapters");
+                }
+
+                if (slot.task->params.generation_prefill_only) {
+                    if (generation_handoffs.size() >=
+                            MAX_STORED_GENERATION_HANDOFFS) {
+                        throw std::runtime_error(
+                                "Generation handoff store is full");
+                    }
+
+                    const std::size_t state_bytes =
+                            slot.generation_handoff
+                                    ->sequence_state.size();
+
+                    const std::size_t logits_count =
+                            slot.generation_handoff
+                                    ->final_logits.size();
+
+                    const std::string producer_backend =
+                            slot.generation_handoff
+                                    ->producer_backend;
+
+                    std::uint64_t handle =
+                            next_generation_handoff_handle++;
+
+                    if (handle == 0) {
+                        handle =
+                                next_generation_handoff_handle++;
+                    }
+
+                    const auto inserted =
+                            generation_handoffs.emplace(
+                                    handle,
+                                    std::move(
+                                            slot.generation_handoff));
+
+                    if (!inserted.second) {
+                        throw std::runtime_error(
+                                "failed to allocate a unique "
+                                "Generation handoff handle");
+                    }
+
+                    const int64_t t_now = ggml_time_us();
+
+                    slot.t_start_generation = t_now;
+                    slot.t_prompt_processing =
+                            std::max<int64_t>(
+                                    1,
+                                    t_now -
+                                            slot.t_start_process_prompt) /
+                            1e3;
+
+                    slot.t_token_generation = 0.0;
+
+                    SLT_INF(
+                            slot,
+                            "Generation Prefill-only handoff retained: "
+                            "handle=%" PRIu64 ", "
+                            "state_bytes=%zu, "
+                            "logits_count=%zu, "
+                            "producer_backend=%s\n",
+                            handle,
+                            state_bytes,
+                            logits_count,
+                            producer_backend.c_str());
+
+                    send_final_response(
+                            slot,
+                            true,
+                            handle,
+                            state_bytes,
+                            logits_count,
+                            producer_backend);
+
+                    slot.release();
+                    return;
                 }
 
                 if (slot.task->params.generation_decode_backend !=
