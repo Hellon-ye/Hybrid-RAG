@@ -1931,8 +1931,121 @@ void server_models_routes::init_routes() {
 
         const json body = json::parse(req.body);
 
-        const std::string requested_mode = json_value(body, "mode", std::string("sequential"));
-        if (requested_mode == "hetero_parallel") {
+        const auto parse_schedule_policy =
+                [](const std::string & mode)
+                        -> std::optional<RagSchedulePolicy> {
+            if (mode == "sequential") {
+                return RagSchedulePolicy::Sequential;
+            }
+
+            if (mode == "carrier_baseline") {
+                return RagSchedulePolicy::CarrierBaseline;
+            }
+
+            if (mode == "hetero_parallel") {
+                return RagSchedulePolicy::HeteroParallel;
+            }
+
+            if (mode == "npu_cpu_cs") {
+                return RagSchedulePolicy::NpuCpuCriticalScore;
+            }
+
+            return std::nullopt;
+        };
+
+        const auto critical_score_for_task =
+                [](RagTaskType type) -> double {
+            constexpr double kProfile4kIndexingMs = 5086.0;
+            constexpr double kProfile4kQueryExpandMs = 1115.0;
+            constexpr double kProfile4kQueryEmbeddingTotalMs = 1242.0;
+            constexpr double kProfile4kRetrievalBranchCount = 3.0;
+            constexpr double kProfile4kQueryEmbeddingNodeMs =
+                    kProfile4kQueryEmbeddingTotalMs /
+                    kProfile4kRetrievalBranchCount;
+            constexpr double kProfile4kSearchingMs = 16.0;
+            constexpr double kProfile4kRerankingMs = 4401.0;
+            constexpr double kProfile4kGenerationMs = 26973.0;
+            constexpr double kProfile4kGenerationPrefillMs = 2283.0;
+            constexpr double kProfile4kGenerationDecodeMs = 26179.0;
+
+            constexpr double kScoreCandidateMerge = 1.0;
+            constexpr double kScoreGenerationDecode =
+                    kProfile4kGenerationDecodeMs;
+            constexpr double kScoreGenerationPrefill =
+                    kProfile4kGenerationPrefillMs +
+                    kScoreGenerationDecode;
+            constexpr double kScoreGeneration =
+                    kProfile4kGenerationMs;
+            constexpr double kScoreReranking =
+                    kProfile4kRerankingMs +
+                    kScoreGeneration;
+            constexpr double kScoreSearching =
+                    kProfile4kSearchingMs +
+                    kScoreReranking;
+            constexpr double kScoreQueryEmbedding =
+                    kProfile4kQueryEmbeddingNodeMs +
+                    kScoreSearching;
+            constexpr double kScoreQueryExpansion =
+                    kProfile4kQueryExpandMs +
+                    kProfile4kQueryEmbeddingTotalMs +
+                    kScoreSearching;
+            constexpr double kScoreDocumentEmbedding =
+                    kProfile4kIndexingMs +
+                    kScoreSearching;
+
+            switch (type) {
+                case RagTaskType::DocumentEmbedding:
+                    return kScoreDocumentEmbedding;
+                case RagTaskType::QueryExpansion:
+                    return kScoreQueryExpansion;
+                case RagTaskType::QueryEmbedding:
+                    return kScoreQueryEmbedding;
+                case RagTaskType::VectorSearch:
+                    return kScoreSearching;
+                case RagTaskType::RetrievalMerge:
+                    return kScoreReranking;
+                case RagTaskType::Reranking:
+                    return kScoreReranking;
+                case RagTaskType::Generation:
+                    return kScoreGeneration;
+                case RagTaskType::GenerationPrefill:
+                    return kScoreGenerationPrefill;
+                case RagTaskType::GenerationDecode:
+                    return kScoreGenerationDecode;
+                case RagTaskType::CandidateMerge:
+                    return kScoreCandidateMerge;
+                case RagTaskType::Finalize:
+                    return 0.0;
+            }
+
+            return 0.0;
+        };
+
+        const std::string requested_mode =
+                json_value(
+                        body,
+                        "mode",
+                        std::string("sequential"));
+
+        const std::optional<RagSchedulePolicy>
+                schedule_policy =
+                        parse_schedule_policy(
+                                requested_mode);
+
+        if (!schedule_policy.has_value()) {
+            res_err(
+                    res,
+                    format_error_response(
+                            "unsupported RAG mode '" +
+                            requested_mode +
+                            "'; supported modes: "
+                            "sequential, carrier_baseline, "
+                            "hetero_parallel, npu_cpu_cs",
+                            ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        {
             auto runtime =
                     std::make_shared<RagRequestRuntime>();
 
@@ -2121,7 +2234,7 @@ void server_models_routes::init_routes() {
                             runtime->request_id &
                             0x7fffffffU);
             phase_a.policy =
-                    RagSchedulePolicy::HeteroParallel;
+                    *schedule_policy;
             phase_a.runtime = runtime.get();
 
             phase_a.add_node(
@@ -2133,6 +2246,11 @@ void server_models_routes::init_routes() {
                     1,
                     RagTaskType::QueryExpansion,
                     RagBackend::CPU);
+
+            for (auto & node : phase_a.nodes) {
+                node.critical_score =
+                        critical_score_for_task(node.type);
+            }
 
             if (!scheduler.run(phase_a)) {
                 const std::string error =
@@ -2193,7 +2311,7 @@ void server_models_routes::init_routes() {
             phase_b.request_id =
                     phase_a.request_id;
             phase_b.policy =
-                    RagSchedulePolicy::HeteroParallel;
+                    *schedule_policy;
             phase_b.runtime = runtime.get();
 
             constexpr int branch_base_id = 100;
@@ -2353,6 +2471,11 @@ void server_models_routes::init_routes() {
             phase_b.add_dependency(
                     candidate_merge_id,
                     finalize_id);
+
+            for (auto & node : phase_b.nodes) {
+                node.critical_score =
+                        critical_score_for_task(node.type);
+            }
 
             if (!scheduler.run(phase_b)) {
                 const std::string error =
@@ -2625,7 +2748,7 @@ void server_models_routes::init_routes() {
                         },
                         {
                             "mode_used",
-                            "hetero_parallel",
+                            requested_mode,
                         },
                         {
                             "scheduler_metrics",

@@ -1,0 +1,43 @@
+Phase 5 mode routing and critical-score acceptance
+
+Invalid mode:
+- HTTP 400
+- invalid_request_error
+- supported mode list returned
+
+sequential:
+- HTTP 200
+- mode_used=sequential
+- 3 generation candidates completed
+- generation nodes serialized on worker 0
+
+carrier_baseline:
+- HTTP 200
+- mode_used=carrier_baseline
+- 3 generation candidates completed
+- generation nodes serialized on worker 0
+
+hetero_parallel:
+- HTTP 200
+- mode_used=hetero_parallel
+- 3 generation candidates completed concurrently
+- generation overlap verified
+
+npu_cpu_cs:
+- HTTP 200
+- mode_used=npu_cpu_cs
+- 3 generation candidates completed concurrently
+- generation overlap verified
+
+Critical-score validation:
+- profiling-derived scores assigned to real RAG DAG nodes
+- scheduler unit test verifies execution order 100 > 10 > 1
+- Android Phase 5C integration regression passed
+- task_count=13
+- failed_tasks=0
+- PHASE5C_ANDROID_PASS=True
+
+Build and deployment:
+- Android llama-server build passed
+- libllama-server-impl.so size=57665352 bytes
+- SHA256=0c0ea1c114d4455f1c2e3d901f304a19c7cca65abd7dcd4783199dd148363d98

@@ -1,0 +1,1 @@
+{"error":{"code":400,"message":"unsupported RAG mode 'invalid_mode'; supported modes: sequential, carrier_baseline, hetero_parallel, npu_cpu_cs","type":"invalid_request_error"}}

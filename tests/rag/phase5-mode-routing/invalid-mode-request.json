@@ -1,0 +1,19 @@
+{
+  "doc": "北京是中国的首都，也是全国政治文化中心。\n上海是中国重要的经济和金融中心。\n中国的政治中心位于北京。\n故宫位于北京，是中国著名的古代宫殿建筑群。\n长江是中国最长的河流。\n熊猫主要生活在中国西南地区，以竹子为食。",
+  "query": "请介绍中国首都的地位和著名历史建筑。",
+  "generation_model": "qwen3-4b",
+  "embedding_model": "qwen3-embedding-0.6b",
+  "expansion_model": "qwen3-0.6b-base",
+  "rerank_model": "qwen3-reranker-0.6b",
+  "enable_query_expansion": true,
+  "top_k": 5,
+  "top_n": 3,
+  "max_tokens": 4,
+  "temperature": 0.2,
+  "mode": "invalid_mode",
+  "generation_prefill_backend": "npu",
+  "generation_decode_backend": "cpu",
+  "backend_sampling": false,
+  "generation_candidate_repeats": 1,
+  "seed": 1234
+}
