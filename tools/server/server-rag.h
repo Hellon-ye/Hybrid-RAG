@@ -113,6 +113,8 @@ struct RagRequestRuntime {
 
     // Scheduler-visible per-candidate generation state.
     std::vector<RagGenerationCandidate> generation_candidates;
+    std::size_t selected_generation_candidate_index =
+            RAG_INVALID_INDEX;
 
     std::string final_answer;
     RagStageMetrics stage_metrics;

@@ -1,0 +1,27 @@
+Phase 4 multi-candidate generation acceptance
+
+PASS: candidate_count
+PASS: candidate_indices
+PASS: independent_seeds
+PASS: all_candidates_success
+PASS: generation_node_count
+PASS: generation_nodes_completed
+PASS: generation_nodes_overlap
+PASS: candidate_merge_completed
+PASS: finalize_completed
+PASS: selected_candidate_valid
+PASS: answer_matches_selected
+
+selected_candidate=0
+answer_length=28
+candidate=0 seed=1234 tokens=16 success=True
+candidate=1 seed=1235 tokens=16 success=True
+candidate=2 seed=1236 tokens=16 success=True
+generation_node=0 worker=0 start=56779 end=71220 status=completed
+generation_node=1 worker=2 start=56779 end=71835 status=completed
+generation_node=2 worker=3 start=56779 end=71599 status=completed
+handoff_count=3
+npu_handoff_count=3
+[35671] 0.10.638.101 I slot   operator(): id  1 | task 1 | generation handoff exported before sampling: request_id=1, source_seq_id=1, prompt_tokens=73, next_position=73, state_bytes=10766052, logits_count=151936, producer_backend=npu
+[35671] 0.11.298.620 I slot   operator(): id  2 | task 0 | generation handoff exported before sampling: request_id=0, source_seq_id=2, prompt_tokens=73, next_position=73, state_bytes=10766052, logits_count=151936, producer_backend=npu
+[35671] 0.11.992.504 I slot   operator(): id  3 | task 2 | generation handoff exported before sampling: request_id=2, source_seq_id=3, prompt_tokens=73, next_position=73, state_bytes=10766052, logits_count=151936, producer_backend=npu

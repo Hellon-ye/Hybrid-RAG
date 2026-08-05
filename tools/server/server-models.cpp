@@ -2009,6 +2009,12 @@ void server_models_routes::init_routes() {
                             "max_tokens",
                             std::size_t(64));
 
+            runtime->request.generation_candidate_repeats =
+                    json_value(
+                            body,
+                            "generation_candidate_repeats",
+                            std::size_t(1));
+
             runtime->request.temperature =
                     json_value(
                             body,
@@ -2052,13 +2058,18 @@ void server_models_routes::init_routes() {
             if (rag_request.max_expanded_queries == 0 ||
                 rag_request.top_k == 0 ||
                 rag_request.top_n == 0 ||
-                rag_request.max_tokens == 0) {
+                rag_request.max_tokens == 0 ||
+                rag_request.generation_candidate_repeats == 0 ||
+                rag_request.generation_candidate_repeats > 8) {
                 res_err(
                         res,
                         format_error_response(
                                 "max_expanded_queries, top_k, "
-                                "top_n and max_tokens must be "
-                                "greater than zero",
+                                "top_n, max_tokens and "
+                                "generation_candidate_repeats must "
+                                "be greater than zero; "
+                                "generation_candidate_repeats must "
+                                "not exceed 8",
                                 ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
@@ -2073,6 +2084,7 @@ void server_models_routes::init_routes() {
                 RagTaskType::RetrievalMerge,
                 RagTaskType::Reranking,
                 RagTaskType::Generation,
+                RagTaskType::CandidateMerge,
                 RagTaskType::Finalize,
             };
 
@@ -2162,6 +2174,14 @@ void server_models_routes::init_routes() {
                         runtime->expanded_queries[index];
             }
 
+            runtime->generation_candidates.clear();
+            runtime->generation_candidates.resize(
+                    runtime->request
+                            .generation_candidate_repeats);
+
+            runtime->selected_generation_candidate_index =
+                    RAG_INVALID_INDEX;
+
             // ----------------------------------------------------------
             // Phase B:
             // Each expanded query gets an independent
@@ -2179,8 +2199,9 @@ void server_models_routes::init_routes() {
             constexpr int branch_base_id = 100;
             constexpr int merge_id = 100000;
             constexpr int rerank_id = 100001;
-            constexpr int generation_id = 100002;
-            constexpr int finalize_id = 100003;
+            constexpr int generation_base_id = 200000;
+            constexpr int candidate_merge_id = 300000;
+            constexpr int finalize_id = 300001;
 
             for (std::size_t query_index = 0;
                  query_index <
@@ -2244,9 +2265,48 @@ void server_models_routes::init_routes() {
                     RagTaskType::Reranking,
                     RagBackend::CPU);
 
+            for (std::size_t candidate_index = 0;
+                 candidate_index <
+                         runtime->generation_candidates.size();
+                 ++candidate_index) {
+                const int generation_id =
+                        generation_base_id +
+                        static_cast<int>(candidate_index);
+
+                phase_b.add_node(
+                        generation_id,
+                        RagTaskType::Generation,
+                        RagBackend::CPU);
+
+                auto * generation_node =
+                        phase_b.find_node(generation_id);
+
+                if (!generation_node) {
+                    res_err(
+                            res,
+                            format_error_response(
+                                    "failed to construct "
+                                    "generation candidate node",
+                                    ERROR_TYPE_SERVER));
+                    return res;
+                }
+
+                generation_node->candidate_index =
+                        candidate_index;
+
+                // The scheduler executes the HTTP orchestration on
+                // CPU. The child model performs NPU Prefill and CPU
+                // Decode internally through generation_handoff.
+                generation_node->allowed_backends = {
+                    RagBackend::CPU,
+                };
+
+                generation_node->stealable = false;
+            }
+
             phase_b.add_node(
-                    generation_id,
-                    RagTaskType::Generation,
+                    candidate_merge_id,
+                    RagTaskType::CandidateMerge,
                     RagBackend::CPU);
 
             phase_b.add_node(
@@ -2273,12 +2333,25 @@ void server_models_routes::init_routes() {
                     merge_id,
                     rerank_id);
 
-            phase_b.add_dependency(
-                    rerank_id,
-                    generation_id);
+            for (std::size_t candidate_index = 0;
+                 candidate_index <
+                         runtime->generation_candidates.size();
+                 ++candidate_index) {
+                const int generation_id =
+                        generation_base_id +
+                        static_cast<int>(candidate_index);
+
+                phase_b.add_dependency(
+                        rerank_id,
+                        generation_id);
+
+                phase_b.add_dependency(
+                        generation_id,
+                        candidate_merge_id);
+            }
 
             phase_b.add_dependency(
-                    generation_id,
+                    candidate_merge_id,
                     finalize_id);
 
             if (!scheduler.run(phase_b)) {
@@ -2341,6 +2414,27 @@ void server_models_routes::init_routes() {
                 return "unknown";
             };
 
+            const auto task_state_name =
+                    [](RagTaskState state)
+                            -> const char * {
+                switch (state) {
+                    case RagTaskState::Pending:
+                        return "pending";
+                    case RagTaskState::Ready:
+                        return "ready";
+                    case RagTaskState::Running:
+                        return "running";
+                    case RagTaskState::Completed:
+                        return "completed";
+                    case RagTaskState::Failed:
+                        return "failed";
+                    case RagTaskState::Cancelled:
+                        return "cancelled";
+                }
+
+                return "unknown";
+            };
+
             json node_metrics = json::array();
 
             const auto append_metrics =
@@ -2385,6 +2479,19 @@ void server_models_routes::init_routes() {
                                     metric
                                             .selected_backend),
                         },
+                        {
+                            "worker_id",
+                            metric.worker_id,
+                        },
+                        {
+                            "stolen",
+                            metric.stolen,
+                        },
+                        {
+                            "status",
+                            task_state_name(
+                                    metric.final_state),
+                        },
                     };
 
                     if (metric.query_index !=
@@ -2397,6 +2504,11 @@ void server_models_routes::init_routes() {
                         RAG_INVALID_INDEX) {
                         item["candidate_index"] =
                                 metric.candidate_index;
+                    }
+
+                    if (!metric.error_message.empty()) {
+                        item["error"] =
+                                metric.error_message;
                     }
 
                     node_metrics.push_back(
@@ -2425,12 +2537,75 @@ void server_models_routes::init_routes() {
                 });
             }
 
+            json generation_candidate_results =
+                    json::array();
+
+            for (const auto & candidate :
+                 runtime->generation_candidates) {
+                json item = {
+                    {
+                        "candidate_index",
+                        candidate.candidate_index,
+                    },
+                    {
+                        "source_query_index",
+                        candidate.source_query_index ==
+                                RAG_INVALID_INDEX
+                                ? json(nullptr)
+                                : json(
+                                      candidate
+                                              .source_query_index),
+                    },
+                    {"seed", candidate.seed},
+                    {"content", candidate.content},
+                    {
+                        "generated_tokens",
+                        candidate.generated_tokens,
+                    },
+                    {
+                        "stop_reason",
+                        candidate.stop_reason,
+                    },
+                    {"success", candidate.success},
+                };
+
+                if (!candidate.error.empty()) {
+                    item["error"] = candidate.error;
+                }
+
+                generation_candidate_results.push_back(
+                        std::move(item));
+            }
+
+            json selected_candidate_index = nullptr;
+
+            if (runtime
+                        ->selected_generation_candidate_index !=
+                RAG_INVALID_INDEX) {
+                selected_candidate_index =
+                        runtime
+                                ->selected_generation_candidate_index;
+            }
+
             res_ok(
                     res,
                     {
                         {
                             "answer",
                             runtime->final_answer,
+                        },
+                        {
+                            "generation_candidate_repeats",
+                            runtime->request
+                                    .generation_candidate_repeats,
+                        },
+                        {
+                            "selected_generation_candidate_index",
+                            selected_candidate_index,
+                        },
+                        {
+                            "generation_candidates",
+                            generation_candidate_results,
                         },
                         {
                             "sub_queries",

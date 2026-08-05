@@ -160,8 +160,7 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
             branch.success = true;
             branch.error.clear();
         } else if (
-                type_ == RagTaskType::RetrievalMerge ||
-                type_ == RagTaskType::CandidateMerge) {
+                type_ == RagTaskType::RetrievalMerge) {
             runtime->query_embeddings.clear();
             runtime->retrieval_results.clear();
 
@@ -200,38 +199,221 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                 for (const auto & item : ranked) { const auto i = item["index"].get<std::size_t>(); if (i < candidates.size()) runtime->reranked_chunks.push_back(candidates[i]); }
             }
         } else if (type_ == RagTaskType::Generation) {
-            runtime->generation_prompt =
+            if (ctx.candidate_index == RAG_INVALID_INDEX ||
+                ctx.candidate_index >=
+                        runtime->generation_candidates.size()) {
+                throw std::runtime_error(
+                        "Generation received an invalid "
+                        "candidate index");
+            }
+
+            auto & candidate =
+                    runtime->generation_candidates.at(
+                            ctx.candidate_index);
+
+            candidate.candidate_index =
+                    ctx.candidate_index;
+
+            candidate.source_query_index =
+                    RAG_INVALID_INDEX;
+
+            candidate.seed =
+                    req.seed +
+                    static_cast<std::uint32_t>(
+                            ctx.candidate_index);
+
+            candidate.prompt =
                     build_generation_prompt(
                             req.query,
                             runtime->reranked_chunks);
 
-            const json response =
-                    models_->request_model_json(
-                            req.generation_model,
-                            "/completion",
-                            {
-                                {"model", req.generation_model},
-                                {"prompt", runtime->generation_prompt},
-                                {"n_predict", req.max_tokens},
-                                {"temperature", req.temperature},
-                                {"stream", false},
-                                {"generation_handoff", true},
-                                {"generation_prefill_backend",
-                                        req.generation_prefill_backend},
-                                {"generation_decode_backend",
-                                        req.generation_decode_backend},
-                                {"backend_sampling", false},
-                            });
+            candidate.content.clear();
+            candidate.stop_reason.clear();
+            candidate.error.clear();
+            candidate.generated_tokens = 0;
+            candidate.success = false;
 
-            if (!response.contains("content") ||
+            try {
+                const json response =
+                        models_->request_model_json(
+                                req.generation_model,
+                                "/completion",
+                                {
+                                    {
+                                        "model",
+                                        req.generation_model,
+                                    },
+                                    {
+                                        "prompt",
+                                        candidate.prompt,
+                                    },
+                                    {
+                                        "n_predict",
+                                        req.max_tokens,
+                                    },
+                                    {
+                                        "temperature",
+                                        req.temperature,
+                                    },
+                                    {
+                                        "seed",
+                                        candidate.seed,
+                                    },
+                                    {"stream", false},
+                                    {
+                                        "generation_handoff",
+                                        true,
+                                    },
+                                    {
+                                        "generation_prefill_backend",
+                                        req.generation_prefill_backend,
+                                    },
+                                    {
+                                        "generation_decode_backend",
+                                        req.generation_decode_backend,
+                                    },
+                                    {
+                                        "backend_sampling",
+                                        false,
+                                    },
+                                });
+
+                if (!response.contains("content") ||
                     !response["content"].is_string()) {
-                throw std::runtime_error(
-                        "generation child returned an invalid "
-                        "completion response");
+                    throw std::runtime_error(
+                            "generation child returned an "
+                            "invalid completion response");
+                }
+
+                candidate.content =
+                        response["content"]
+                                .get<std::string>();
+
+                if (response.contains(
+                            "tokens_predicted") &&
+                    response["tokens_predicted"]
+                            .is_number_integer()) {
+                    const long long value =
+                            response["tokens_predicted"]
+                                    .get<long long>();
+
+                    if (value > 0) {
+                        candidate.generated_tokens =
+                                static_cast<std::size_t>(
+                                        value);
+                    }
+                } else if (
+                        response.contains("timings") &&
+                        response["timings"].is_object() &&
+                        response["timings"].contains(
+                                "predicted_n") &&
+                        response["timings"]["predicted_n"]
+                                .is_number_integer()) {
+                    const long long value =
+                            response["timings"]
+                                    ["predicted_n"]
+                                    .get<long long>();
+
+                    if (value > 0) {
+                        candidate.generated_tokens =
+                                static_cast<std::size_t>(
+                                        value);
+                    }
+                }
+
+                if (response.contains("stop_type") &&
+                    response["stop_type"].is_string()) {
+                    candidate.stop_reason =
+                            response["stop_type"]
+                                    .get<std::string>();
+                } else if (
+                        response.contains("stopped_eos") &&
+                        response["stopped_eos"]
+                                .is_boolean() &&
+                        response["stopped_eos"]
+                                .get<bool>()) {
+                    candidate.stop_reason = "eos";
+                } else if (
+                        response.contains("stopped_limit") &&
+                        response["stopped_limit"]
+                                .is_boolean() &&
+                        response["stopped_limit"]
+                                .get<bool>()) {
+                    candidate.stop_reason = "limit";
+                }
+
+                if (candidate.content.empty()) {
+                    throw std::runtime_error(
+                            "generation candidate returned "
+                            "empty content");
+                }
+
+                candidate.success = true;
+            } catch (const std::exception & error) {
+                // A failed candidate does not immediately fail the
+                // entire DAG. CandidateMerge succeeds when at least
+                // one independent candidate completed successfully.
+                candidate.error = error.what();
+                candidate.success = false;
+            }
+        } else if (type_ == RagTaskType::CandidateMerge) {
+            std::size_t selected =
+                    RAG_INVALID_INDEX;
+
+            std::size_t best_generated_tokens = 0;
+            std::size_t best_content_size = 0;
+
+            for (std::size_t index = 0;
+                 index <
+                         runtime->generation_candidates.size();
+                 ++index) {
+                const auto & candidate =
+                        runtime->generation_candidates[index];
+
+                if (!candidate.success ||
+                    candidate.content.empty()) {
+                    continue;
+                }
+
+                const bool better =
+                        selected == RAG_INVALID_INDEX ||
+                        candidate.generated_tokens >
+                                best_generated_tokens ||
+                        (
+                            candidate.generated_tokens ==
+                                    best_generated_tokens &&
+                            candidate.content.size() >
+                                    best_content_size
+                        );
+
+                if (!better) {
+                    continue;
+                }
+
+                selected = index;
+                best_generated_tokens =
+                        candidate.generated_tokens;
+                best_content_size =
+                        candidate.content.size();
             }
 
+            if (selected == RAG_INVALID_INDEX) {
+                throw std::runtime_error(
+                        "all generation candidates failed");
+            }
+
+            const auto & candidate =
+                    runtime->generation_candidates.at(
+                            selected);
+
+            runtime->selected_generation_candidate_index =
+                    selected;
+
+            runtime->generation_prompt =
+                    candidate.prompt;
+
             runtime->generation_result =
-                    response["content"].get<std::string>();
+                    candidate.content;
         } else if (type_ == RagTaskType::Finalize) {
             runtime->final_answer = runtime->generation_result;
 
