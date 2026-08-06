@@ -1978,7 +1978,7 @@ void server_models_routes::init_routes() {
                     kProfile4kGenerationMs;
             constexpr double kScoreReranking =
                     kProfile4kRerankingMs +
-                    kScoreGeneration;
+                    kScoreGenerationPrefill;
             constexpr double kScoreSearching =
                     kProfile4kSearchingMs +
                     kScoreReranking;
@@ -2197,6 +2197,8 @@ void server_models_routes::init_routes() {
                 RagTaskType::RetrievalMerge,
                 RagTaskType::Reranking,
                 RagTaskType::Generation,
+                RagTaskType::GenerationPrefill,
+                RagTaskType::GenerationDecode,
                 RagTaskType::CandidateMerge,
                 RagTaskType::Finalize,
             };
@@ -2317,7 +2319,8 @@ void server_models_routes::init_routes() {
             constexpr int branch_base_id = 100;
             constexpr int merge_id = 100000;
             constexpr int rerank_id = 100001;
-            constexpr int generation_base_id = 200000;
+            constexpr int generation_prefill_base_id = 200000;
+            constexpr int generation_decode_base_id = 210000;
             constexpr int candidate_merge_id = 300000;
             constexpr int finalize_id = 300001;
 
@@ -2387,39 +2390,59 @@ void server_models_routes::init_routes() {
                  candidate_index <
                          runtime->generation_candidates.size();
                  ++candidate_index) {
-                const int generation_id =
-                        generation_base_id +
+                const int prefill_id =
+                        generation_prefill_base_id +
+                        static_cast<int>(candidate_index);
+
+                const int decode_id =
+                        generation_decode_base_id +
                         static_cast<int>(candidate_index);
 
                 phase_b.add_node(
-                        generation_id,
-                        RagTaskType::Generation,
+                        prefill_id,
+                        RagTaskType::GenerationPrefill,
                         RagBackend::CPU);
 
-                auto * generation_node =
-                        phase_b.find_node(generation_id);
+                phase_b.add_node(
+                        decode_id,
+                        RagTaskType::GenerationDecode,
+                        RagBackend::CPU);
 
-                if (!generation_node) {
+                auto * prefill_node =
+                        phase_b.find_node(prefill_id);
+
+                auto * decode_node =
+                        phase_b.find_node(decode_id);
+
+                if (!prefill_node || !decode_node) {
                     res_err(
                             res,
                             format_error_response(
-                                    "failed to construct "
-                                    "generation candidate node",
+                                    "failed to construct split "
+                                    "generation candidate nodes",
                                     ERROR_TYPE_SERVER));
                     return res;
                 }
 
-                generation_node->candidate_index =
+                prefill_node->candidate_index =
                         candidate_index;
 
-                // The scheduler executes the HTTP orchestration on
-                // CPU. The child model performs NPU Prefill and CPU
-                // Decode internally through generation_handoff.
-                generation_node->allowed_backends = {
+                decode_node->candidate_index =
+                        candidate_index;
+
+                // Both nodes perform HTTP orchestration on CPU.
+                // The child completion request selects the actual
+                // Prefill and Decode compute backends.
+                prefill_node->allowed_backends = {
                     RagBackend::CPU,
                 };
 
-                generation_node->stealable = false;
+                decode_node->allowed_backends = {
+                    RagBackend::CPU,
+                };
+
+                prefill_node->stealable = false;
+                decode_node->stealable = false;
             }
 
             phase_b.add_node(
@@ -2455,16 +2478,24 @@ void server_models_routes::init_routes() {
                  candidate_index <
                          runtime->generation_candidates.size();
                  ++candidate_index) {
-                const int generation_id =
-                        generation_base_id +
+                const int prefill_id =
+                        generation_prefill_base_id +
+                        static_cast<int>(candidate_index);
+
+                const int decode_id =
+                        generation_decode_base_id +
                         static_cast<int>(candidate_index);
 
                 phase_b.add_dependency(
                         rerank_id,
-                        generation_id);
+                        prefill_id);
 
                 phase_b.add_dependency(
-                        generation_id,
+                        prefill_id,
+                        decode_id);
+
+                phase_b.add_dependency(
+                        decode_id,
                         candidate_merge_id);
             }
 
@@ -2642,6 +2673,80 @@ void server_models_routes::init_routes() {
             append_metrics(phase_a);
             append_metrics(phase_b);
 
+            // Report wall-clock spans rather than summing node execution
+            // times. Multiple candidate Prefill and Decode nodes may run
+            // concurrently, so summing their durations would double-count
+            // overlapping intervals.
+            const auto task_wall_span_ms =
+                    [&](RagTaskType first_type,
+                        RagTaskType second_type)
+                            -> std::size_t {
+                bool found = false;
+                int64_t earliest_start_ms = 0;
+                int64_t latest_end_ms = 0;
+
+                for (const auto & entry :
+                     phase_b.metrics) {
+                    const auto & metric =
+                            entry.second;
+
+                    if (metric.task_type != first_type &&
+                        metric.task_type != second_type) {
+                        continue;
+                    }
+
+                    if (metric.final_state !=
+                                RagTaskState::Completed ||
+                        metric.end_ms < metric.start_ms) {
+                        continue;
+                    }
+
+                    if (!found ||
+                        metric.start_ms <
+                                earliest_start_ms) {
+                        earliest_start_ms =
+                                metric.start_ms;
+                    }
+
+                    if (!found ||
+                        metric.end_ms >
+                                latest_end_ms) {
+                        latest_end_ms =
+                                metric.end_ms;
+                    }
+
+                    found = true;
+                }
+
+                return found &&
+                               latest_end_ms >
+                                       earliest_start_ms
+                        ? static_cast<std::size_t>(
+                                  latest_end_ms -
+                                  earliest_start_ms)
+                        : 0;
+            };
+
+            runtime->generation_sub_metrics.prefill_ms =
+                    task_wall_span_ms(
+                            RagTaskType::GenerationPrefill,
+                            RagTaskType::GenerationPrefill);
+
+            runtime->generation_sub_metrics.decode_ms =
+                    task_wall_span_ms(
+                            RagTaskType::GenerationDecode,
+                            RagTaskType::GenerationDecode);
+
+            stage_metrics.generation_ms =
+                    task_wall_span_ms(
+                            RagTaskType::GenerationPrefill,
+                            RagTaskType::GenerationDecode);
+
+            stage_metrics.total_ms =
+                    elapsed_ms(total_start_ms);
+
+            runtime->stage_metrics = stage_metrics;
+
             json branch_results = json::array();
 
             for (const auto & branch :
@@ -2688,6 +2793,29 @@ void server_models_routes::init_routes() {
                     {
                         "stop_reason",
                         candidate.stop_reason,
+                    },
+                    {
+                        "prefill_success",
+                        candidate.prefill_success,
+                    },
+                    {
+                        "generation_handoff_handle",
+                        candidate.generation_handoff_handle,
+                    },
+                    {
+                        "generation_handoff_state_bytes",
+                        candidate
+                                .generation_handoff_state_bytes,
+                    },
+                    {
+                        "generation_handoff_logits_count",
+                        candidate
+                                .generation_handoff_logits_count,
+                    },
+                    {
+                        "generation_handoff_producer_backend",
+                        candidate
+                                .generation_handoff_producer_backend,
                     },
                     {"success", candidate.success},
                 };
@@ -2758,10 +2886,24 @@ void server_models_routes::init_routes() {
                             "stage_metrics",
                             {
                                 {
+                                    "generation_ms",
+                                    stage_metrics.generation_ms,
+                                },
+                                {
+                                    "generation_prefill_ms",
+                                    runtime
+                                            ->generation_sub_metrics
+                                            .prefill_ms,
+                                },
+                                {
+                                    "generation_decode_ms",
+                                    runtime
+                                            ->generation_sub_metrics
+                                            .decode_ms,
+                                },
+                                {
                                     "total_ms",
-                                    static_cast<std::size_t>(
-                                            ggml_time_ms() -
-                                            total_start_ms),
+                                    stage_metrics.total_ms,
                                 },
                             },
                         },

@@ -33,6 +33,15 @@ struct RagGenerationCandidate {
     std::string error;
 
     std::size_t generated_tokens = 0;
+
+    // GenerationPrefill stores a one-shot handoff here. The matching
+    // GenerationDecode node for this candidate consumes the handle.
+    std::uint64_t generation_handoff_handle = 0;
+    std::size_t generation_handoff_state_bytes = 0;
+    std::size_t generation_handoff_logits_count = 0;
+    std::string generation_handoff_producer_backend;
+    bool prefill_success = false;
+
     bool success = false;
 };
 
