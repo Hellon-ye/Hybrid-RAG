@@ -412,16 +412,29 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                                             "model",
                                             req.generation_model,
                                         },
+                                        // The handoff already contains the
+                                        // complete prefill sequence state.
+                                        // Re-sending candidate.prompt would
+                                        // append the prompt a second time.
                                         {
                                             "prompt",
-                                            candidate.prompt,
+                                            "",
                                         },
                                         {
                                             "n_predict",
                                             req.max_tokens,
                                         },
                                         {"n_cmpl", 1},
+                                        {
+                                            "temperature",
+                                            req.temperature,
+                                        },
+                                        {
+                                            "seed",
+                                            candidate.seed,
+                                        },
                                         {"stream", false},
+                                        {"cache_prompt", false},
                                         {
                                             "generation_handoff",
                                             true,
