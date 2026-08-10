@@ -108,6 +108,7 @@ struct RagRequestRuntime {
     std::vector<std::string> chunks;
     std::vector<std::vector<float>> document_embeddings;
     std::vector<std::string> expanded_queries;
+    bool query_expansion_used = false;
     // Transitional batch fields retained until the fan-out DAG commit.
     std::vector<std::vector<float>> query_embeddings;
     std::vector<std::vector<std::size_t>> retrieval_results;

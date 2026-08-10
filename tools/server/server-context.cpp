@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
+#include <future>
 #include <memory>
 #include <filesystem>
 #include <utility>
@@ -222,8 +223,10 @@ struct server_slot {
     // It is request-scoped and is destroyed by reset()/release().
     std::unique_ptr<server_generation_handoff> generation_handoff;
 
-    // Owns the independent Decode Context and sampler after the formal
-    // Prefill/Decode handoff. The main slot Context remains Prompt-only.
+    // Owns the persistent Decode worker assigned to this slot. begin()
+    // replaces request-local state while retaining the expensive CPU
+    // Context between successive handoffs. The main slot Context remains
+    // Prompt-only.
     std::unique_ptr<server_generation_decode_executor>
             generation_decode_executor;
 
@@ -325,7 +328,9 @@ struct server_slot {
         generated_token_probs.clear();
         json_schema = json();
 
-        generation_decode_executor.reset();
+        if (generation_decode_executor) {
+            generation_decode_executor->reset();
+        }
         generation_handoff.reset();
 
         // clear speculative decoding stats
@@ -1255,6 +1260,11 @@ private:
 
             common_params params_decode_cpu = params_base;
 
+            // The target NPU model may require --no-mmap, but the dedicated
+            // CPU decode model should use mmap to avoid duplicating the full
+            // model weights in resident memory.
+            params_decode_cpu.use_mmap = true;
+
             // An explicit, null-terminated CPU device list prevents the
             // model loader from auto-selecting Hexagon or another
             // accelerator. n_gpu_layers=0 keeps every model tensor on CPU.
@@ -2088,18 +2098,31 @@ private:
                 slot.t_start_generation = 0;
                 slot.t_prompt_processing = 0.0;
                 slot.t_token_generation = 0.0;
+                // Handoff consumers bypass the normal Prompt-processing path,
+                // which ordinarily initializes request-local generation
+                // counters when the Prompt reaches DONE_PROMPT. Reset them
+                // here so a persistent Decode slot starts every continuation
+                // with an independent token budget and timing window.
+                slot.n_decoded = 0;
+                slot.n_remaining = -1;
+                slot.i_batch = -1;
+                slot.has_next_token = true;
+                slot.t_print_last = 0;
+                slot.n_decoded_last = 0;
                 slot.n_prompt_tokens_cache = 0;
                 slot.n_prompt_tokens_processed =
                         static_cast<int32_t>(
                                 stored_generation_handoff
                                         ->prompt_tokens.size());
 
-                slot.generation_decode_executor =
-                        std::make_unique<
-                                server_generation_decode_executor>(
-                                    decode_model,
-                                    decode_context_params,
-                                    0);
+                if (!slot.generation_decode_executor) {
+                    slot.generation_decode_executor =
+                            std::make_unique<
+                                    server_generation_decode_executor>(
+                                        decode_model,
+                                        decode_context_params,
+                                        0);
+                }
 
                 // begin() validates and restores the sequence state,
                 // reconstructs the sampler, and samples the first token.
@@ -2107,7 +2130,9 @@ private:
                         slot.generation_decode_executor->begin(
                                 *stored_generation_handoff);
             } catch (const std::exception & e) {
-                slot.generation_decode_executor.reset();
+                if (slot.generation_decode_executor) {
+                    slot.generation_decode_executor->reset();
+                }
 
                 send_error(
                         slot,
@@ -3408,6 +3433,14 @@ private:
         // decode_next() evaluates the previously sampled pending token in
         // the independent Context and returns the next sampled-and-accepted
         // token. No generated token is inserted into the main Context.
+        //
+        // Each Decode Context is independent and owns its mutable KV/sampler
+        // state. Launch their CPU evaluations concurrently, then serialize
+        // only the lightweight response bookkeeping on the server loop.
+        std::vector<std::pair<
+                server_slot *,
+                std::future<llama_token>>> generation_decode_futures;
+
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING ||
                     !slot.generation_decode_executor ||
@@ -3415,15 +3448,26 @@ private:
                 return;
             }
 
-            const llama_token token =
-                    slot.generation_decode_executor->decode_next();
+            generation_decode_futures.emplace_back(
+                    &slot,
+                    std::async(
+                            std::launch::async,
+                            [&slot]() {
+                                return slot
+                                        .generation_decode_executor
+                                        ->decode_next();
+                            }));
+        });
 
+        for (auto & decode_future : generation_decode_futures) {
+            server_slot & slot = *decode_future.first;
+            const llama_token token = decode_future.second.get();
             process_generation_token(
                     slot,
                     token,
                     -1,
                     false);
-        });
+        }
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
@@ -4509,12 +4553,14 @@ private:
                             "Generation Decode model is unavailable");
                 }
 
-                slot.generation_decode_executor =
-                        std::make_unique<
-                                server_generation_decode_executor>(
-                                    decode_model,
-                                    decode_context_params,
-                                    0);
+                if (!slot.generation_decode_executor) {
+                    slot.generation_decode_executor =
+                            std::make_unique<
+                                    server_generation_decode_executor>(
+                                        decode_model,
+                                        decode_context_params,
+                                        0);
+                }
 
                 const llama_token first_token =
                         slot.generation_decode_executor->begin(

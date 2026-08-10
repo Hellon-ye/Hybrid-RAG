@@ -49,6 +49,9 @@ server_generation_decode_executor(
                 "failed to create CPU Decode Context");
     }
 
+    // Match the dedicated CPU decode context to the four-thread baseline.
+    llama_set_n_threads(ctx_.get(), 4, 4);
+
     if (sequence_id_ >=
             static_cast<llama_seq_id>(
                     llama_n_seq_max(ctx_.get()))) {

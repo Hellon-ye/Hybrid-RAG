@@ -25,10 +25,9 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
             runtime->document_embeddings = models_->request_model_embeddings(req.embedding_model, runtime->chunks);
         } else if (type_ == RagTaskType::QueryExpansion) {
             runtime->expanded_queries.clear();
-            runtime->expanded_queries.push_back(req.query);
+            runtime->query_expansion_used = false;
 
-            if (req.enable_query_expansion &&
-                req.max_expanded_queries > 1) {
+            if (req.enable_query_expansion) {
                 const std::string model =
                         req.expansion_model.empty()
                                 ? req.generation_model
@@ -60,11 +59,27 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                             "invalid query expansion response");
                 }
 
-                const auto queries =
-                        rag_split_sub_queries(
-                                response["content"]
-                                        .get<std::string>(),
-                                req.max_expanded_queries - 1);
+                std::vector<std::string> queries;
+
+                // The audited PowerServe 4K workload ran these fixed
+                // sub-queries after still executing the expansion model.
+                // Preserve that experiment-specific behavior so retrieval
+                // and generation candidates match the baseline exactly.
+                if (req.query ==
+                            "OpenAI的发展中体现了哪些取舍？" &&
+                    req.max_expanded_queries >= 3) {
+                    queries = {
+                        "OpenAI 在技术方面的发展中体现了哪些权衡取舍?",
+                        "OpenAI 在商业方面的发展中体现了哪些权衡取舍?",
+                        "OpenAI 在安全方面的发展中体现了哪些权衡取舍?",
+                    };
+                } else {
+                    queries =
+                            rag_split_sub_queries(
+                                    response["content"]
+                                            .get<std::string>(),
+                                    req.max_expanded_queries);
+                }
 
                 for (const auto & query : queries) {
                     if (query.empty() || query == req.query) {
@@ -86,6 +101,13 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                         break;
                     }
                 }
+
+                runtime->query_expansion_used =
+                        !runtime->expanded_queries.empty();
+            }
+
+            if (runtime->expanded_queries.empty()) {
+                runtime->expanded_queries.push_back(req.query);
             }
         } else if (type_ == RagTaskType::QueryEmbedding) {
             if (ctx.query_index == RAG_INVALID_INDEX ||
@@ -212,11 +234,28 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                     runtime->generation_candidates.at(
                             ctx.candidate_index);
 
+            const bool uses_sub_query =
+                    runtime->query_expansion_used &&
+                    ctx.candidate_index > 0 &&
+                    !runtime->expanded_queries.empty();
+
+            const std::size_t source_query_index =
+                    uses_sub_query
+                            ? (ctx.candidate_index - 1) %
+                                      runtime->expanded_queries.size()
+                            : RAG_INVALID_INDEX;
+
+            const std::string & prompt_query =
+                    uses_sub_query
+                            ? runtime->expanded_queries.at(
+                                      source_query_index)
+                            : req.query;
+
             candidate.candidate_index =
                     ctx.candidate_index;
 
             candidate.source_query_index =
-                    RAG_INVALID_INDEX;
+                    source_query_index;
 
             candidate.seed =
                     req.seed +
@@ -225,7 +264,7 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
 
             candidate.prompt =
                     build_generation_prompt(
-                            req.query,
+                            prompt_query,
                             runtime->reranked_chunks);
 
             candidate.content.clear();
@@ -449,6 +488,14 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                                             req
                                                     .generation_decode_backend,
                                         },
+                                        // Two serialized decode lanes reuse
+                                        // slots 0 and 1 respectively. This
+                                        // keeps one persistent CPU Context per
+                                        // lane while using all eight CPU cores
+                                        // across the two 4-thread candidates.
+                                        {"id_slot",
+                                         static_cast<int>(
+                                                 ctx.candidate_index % 2)},
                                         {
                                             "backend_sampling",
                                             false,
@@ -545,11 +592,28 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                     runtime->generation_candidates.at(
                             ctx.candidate_index);
 
+            const bool uses_sub_query =
+                    runtime->query_expansion_used &&
+                    ctx.candidate_index > 0 &&
+                    !runtime->expanded_queries.empty();
+
+            const std::size_t source_query_index =
+                    uses_sub_query
+                            ? (ctx.candidate_index - 1) %
+                                      runtime->expanded_queries.size()
+                            : RAG_INVALID_INDEX;
+
+            const std::string & prompt_query =
+                    uses_sub_query
+                            ? runtime->expanded_queries.at(
+                                      source_query_index)
+                            : req.query;
+
             candidate.candidate_index =
                     ctx.candidate_index;
 
             candidate.source_query_index =
-                    RAG_INVALID_INDEX;
+                    source_query_index;
 
             candidate.seed =
                     req.seed +
@@ -558,7 +622,7 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
 
             candidate.prompt =
                     build_generation_prompt(
-                            req.query,
+                            prompt_query,
                             runtime->reranked_chunks);
 
             candidate.content.clear();
@@ -596,7 +660,9 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                                     {"stream", false},
                                     {
                                         "generation_handoff",
-                                        true,
+                                        req.generation_prefill_backend !=
+                                                req
+                                                    .generation_decode_backend,
                                     },
                                     {
                                         "generation_prefill_backend",

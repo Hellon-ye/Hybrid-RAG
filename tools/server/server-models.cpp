@@ -2294,10 +2294,18 @@ void server_models_routes::init_routes() {
                         runtime->expanded_queries[index];
             }
 
+            std::size_t generation_candidate_count = 1;
+
+            if (runtime->query_expansion_used) {
+                generation_candidate_count +=
+                        runtime->expanded_queries.size() *
+                        runtime->request
+                                .generation_candidate_repeats;
+            }
+
             runtime->generation_candidates.clear();
             runtime->generation_candidates.resize(
-                    runtime->request
-                            .generation_candidate_repeats);
+                    generation_candidate_count);
 
             runtime->selected_generation_candidate_index =
                     RAG_INVALID_INDEX;
@@ -2319,6 +2327,7 @@ void server_models_routes::init_routes() {
             constexpr int branch_base_id = 100;
             constexpr int merge_id = 100000;
             constexpr int rerank_id = 100001;
+            constexpr int generation_base_id = 190000;
             constexpr int generation_prefill_base_id = 200000;
             constexpr int generation_decode_base_id = 210000;
             constexpr int candidate_merge_id = 300000;
@@ -2390,6 +2399,41 @@ void server_models_routes::init_routes() {
                  candidate_index <
                          runtime->generation_candidates.size();
                  ++candidate_index) {
+                if (runtime->request
+                            .generation_prefill_backend ==
+                    runtime->request
+                            .generation_decode_backend) {
+                    const int generation_id =
+                            generation_base_id +
+                            static_cast<int>(candidate_index);
+
+                    phase_b.add_node(
+                            generation_id,
+                            RagTaskType::Generation,
+                            RagBackend::CPU);
+
+                    auto * generation_node =
+                            phase_b.find_node(generation_id);
+
+                    if (!generation_node) {
+                        res_err(
+                                res,
+                                format_error_response(
+                                        "failed to construct "
+                                        "generation candidate node",
+                                        ERROR_TYPE_SERVER));
+                        return res;
+                    }
+
+                    generation_node->candidate_index =
+                            candidate_index;
+                    generation_node->allowed_backends = {
+                        RagBackend::CPU,
+                    };
+                    generation_node->stealable = false;
+                    continue;
+                }
+
                 const int prefill_id =
                         generation_prefill_base_id +
                         static_cast<int>(candidate_index);
@@ -2478,6 +2522,25 @@ void server_models_routes::init_routes() {
                  candidate_index <
                          runtime->generation_candidates.size();
                  ++candidate_index) {
+                if (runtime->request
+                            .generation_prefill_backend ==
+                    runtime->request
+                            .generation_decode_backend) {
+                    const int generation_id =
+                            generation_base_id +
+                            static_cast<int>(candidate_index);
+
+                    phase_b.add_dependency(
+                            rerank_id,
+                            generation_id);
+
+                    phase_b.add_dependency(
+                            generation_id,
+                            candidate_merge_id);
+
+                    continue;
+                }
+
                 const int prefill_id =
                         generation_prefill_base_id +
                         static_cast<int>(candidate_index);
@@ -2493,6 +2556,20 @@ void server_models_routes::init_routes() {
                 phase_b.add_dependency(
                         prefill_id,
                         decode_id);
+
+                // Keep prefills independent and use two CPU decode lanes.
+                // Each lane stays serialized and reuses one persistent
+                // 4-thread Decode Context; two lanes match the 8 CPU cores
+                // without the oversubscription of four concurrent contexts.
+                if (candidate_index > 1) {
+                    const int previous_decode_id =
+                            generation_decode_base_id +
+                            static_cast<int>(candidate_index - 2);
+
+                    phase_b.add_dependency(
+                            previous_decode_id,
+                            decode_id);
+                }
 
                 phase_b.add_dependency(
                         decode_id,
